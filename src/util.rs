@@ -1,11 +1,13 @@
-// 共用小工具：截斷、家目錄、時間、資料目錄。
+// Shared utilities: truncation, home directory, time, data directory.
 
 use std::path::PathBuf;
 
-// truncate：按位元組數截斷（對應 Go 的 s[:n]）。Go 容忍切在多位元組字元中間
-// （產生無效 UTF-8），Rust 切片必須落在 char boundary 上否則 panic——
-// 這是移植時最容易炸的差異點，統一用 floor_char_boundary 對齊到
-// 「不超過 n 位元組的最大合法邊界」，代價是比 Go 少切最多 2 個位元組。
+// truncate: cut by byte count (matching Go's s[:n]). Go tolerates cutting
+// inside a multibyte character (producing invalid UTF-8); a Rust slice must
+// land on a char boundary or it panics — the most explosive difference when
+// porting. We uniformly align with floor_char_boundary to "the largest legal
+// boundary not exceeding n bytes", at the cost of cutting up to 2 bytes less
+// than Go.
 pub fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
@@ -14,8 +16,9 @@ pub fn truncate(s: &str, n: usize) -> String {
     format!("{}…(truncated)", &s[..end])
 }
 
-// std::env::home_dir 已棄用；這裡手寫 HOME → USERPROFILE fallback（Unix → Windows）。
-// 都沒有時回空路徑，讓上層路徑「壞得無害」。
+// std::env::home_dir is deprecated; hand-written HOME → USERPROFILE fallback
+// (Unix → Windows). Neither present → empty path, keeping downstream paths
+// harmlessly broken.
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -23,11 +26,13 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-// data_dir：執行期產物（state/、advisor.log、hooks-debug.log）的跨平台根目錄。
-// dirs::data_local_dir() 落在各 OS 慣例位置：Linux ~/.local/share（尊重
-// $XDG_DATA_HOME）、macOS ~/Library/Application Support、Windows %LOCALAPPDATA%；
-// 解析失敗（罕見）退回 home 下的 .zcode-advisor。
-// 刻意不用 Go 版的 ~/.zcode/zcode-advisor——那是 Go 遺留目錄，Rust 版與之脫鉤。
+// data_dir: the cross-platform root for runtime artifacts (state/,
+// advisor.log, hooks-debug.log). dirs::data_local_dir() lands in each OS's
+// conventional location: Linux ~/.local/share (honoring $XDG_DATA_HOME),
+// macOS ~/Library/Application Support, Windows %LOCALAPPDATA%; on resolution
+// failure (rare) it falls back to .zcode-advisor under home. Deliberately not
+// the Go version's ~/.zcode/zcode-advisor — that's the legacy Go directory;
+// this version is decoupled from it.
 pub fn data_dir() -> PathBuf {
     match dirs::data_local_dir() {
         Some(d) => d.join("zcode-advisor"),
@@ -35,7 +40,9 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
-// unix 秒。時鐘不可用時回 0（與 Go 版 time.Now 失敗的後果同級：狀態計數失效而已）。
+// unix seconds. Falls back to 0 when the clock is unavailable (same
+// consequence as the Go version's time.Now failing: the state counters just
+// stop working).
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -43,8 +50,9 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-// rfc3339_utc：不引入 chrono 的最小實作（Howard Hinnant 的 civil_from_days 演算法）。
-// UTC 時間戳（日誌與人類可讀輸出用）；本地時區不值得為此拉 tz 資料庫。
+// rfc3339_utc: a minimal implementation without pulling chrono (Howard
+// Hinnant's civil_from_days algorithm). UTC timestamps (for logs and
+// human-readable output); local time isn't worth a tz database.
 pub fn rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -73,7 +81,8 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-// 建立私有目錄（unix: 0700；Windows 走 profile 預設 ACL）。已存在視為成功。
+// Create a private directory (unix: 0700; Windows relies on the profile's
+// default ACL). Already existing counts as success.
 pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -86,7 +95,8 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-// 以私有權限開檔（unix: 0600；Windows 同上走預設 ACL）。
+// Open a file with private permissions (unix: 0600; Windows likewise via the
+// default ACL).
 pub fn open_private_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -120,23 +130,25 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefghij", 10), "abcdefghij");
         assert_eq!(truncate("abcdefghijk", 10), "abcdefghij…(truncated)");
-        // 3 位元組 CJK：n 落在字元中間時退到邊界（Go 會切出半個字）
+        // 3-byte CJK: n landing mid-character falls back to the boundary
+        // (Go would cut out half a character). Intentionally multibyte.
         assert_eq!(truncate("你好世界", 4), "你…(truncated)");
         assert_eq!(truncate("你好世界", 6), "你好…(truncated)");
-        // 4 位元組 emoji
+        // 4-byte emoji
         assert_eq!(truncate("a😀b😀c", 3), "a…(truncated)");
     }
 
     #[test]
     fn rfc3339_known_values() {
         assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_725_500_000), "2024-09-05T01:33:20Z"); // 與 date -u 對拍
-        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z"); // 閏年
+        assert_eq!(rfc3339_utc(1_725_500_000), "2024-09-05T01:33:20Z"); // cross-checked against date -u
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z"); // leap year
     }
 
     #[test]
     fn data_dir_is_namespaced() {
-        // 不論落在哪，最後一段必須是 zcode-advisor（跨平台一致性由 dirs 保證）
+        // wherever it lands, the last component must be zcode-advisor
+        // (cross-platform consistency guaranteed by dirs)
         let d = data_dir();
         assert!(d.ends_with("zcode-advisor"), "{d:?}");
     }

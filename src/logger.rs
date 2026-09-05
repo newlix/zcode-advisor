@@ -1,19 +1,27 @@
-// 行為軌跡日誌（advisor.log）：與 hooks-debug.log 分工——那邊記「ZCode 餵了什麼」
-// （原始 stdin 擷取），這邊記「我們做了什麼、為什麼」（consult 生命週期、
-// hook 決策點）。目的是事後追查：顧問為什麼這樣回答、hook 為什麼觸發／沒觸發。
+// Behavior-trace log (advisor.log): division of labor with hooks-debug.log —
+// that one records "what ZCode fed us" (raw stdin captures), this one records
+// "what we did and why" (consult lifecycle, hook decision points). The purpose
+// is post-hoc forensics: why the advisor answered the way it did, why a hook
+// fired / didn't fire.
 //
-// 只有結構性軌跡（決策、結果、時間、大小），不記內容——「顧問到底看到什麼」
-// （完整 question、對話、建議本文）由 ZCode 的 rollout 檔原生保存
-// （~/.zcode/cli/rollout/），事後永遠可重現，日誌不重複捕。
+// Structural traces only (decisions, outcomes, timings, sizes), never content —
+// "what the advisor actually saw" (the full question, the conversation, the
+// advice text) is preserved natively by ZCode's rollout files
+// (~/.zcode/cli/rollout/), permanently reproducible; the log doesn't duplicate
+// that.
 //
-// 設計約束：
-// - 記錄系統絕不能讓任務失敗：任何寫檔錯誤靜默丟棄（同 hooks-debug 哲學）。
-// - 多 process 並發（兩條 MCP 連線＋一次性的 hook process）：O_APPEND＋
-//   單一 write_all（行長遠小於 page size）保持行完整；每行開檔即關，
-//   頻率極低（每次 consult／hook 一兩行），無需持有檔案。
-// - stdout 永遠不留痕跡（MCP 協議通道）；stderr 的既有行照舊，這裡只寫檔案。
-// - 無等級開關、無環境變數：兩個等級（INFO/ERROR）都是severity標記，
-//   全時全開——行為軌跡的量本來就該全記，內容另有歸宿。
+// Design constraints:
+// - The logging system must never fail a task: any write error is silently
+//   dropped (same philosophy as hooks-debug).
+// - Multi-process concurrency (two MCP connections + one-shot hook
+//   processes): O_APPEND + a single write_all per line (line length far below
+//   page size) keeps lines whole; the file is opened and closed per line —
+//   the rate is tiny (a line or two per consult/hook), no need to hold it.
+// - stdout never leaves a trace (it's the MCP protocol channel); existing
+//   stderr lines stay as they are — this module only writes the file.
+// - No level switches, no environment variables: both levels (INFO/ERROR)
+//   are severity markers, always on — a behavior trace should record
+//   everything; content has its own home.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,9 +29,9 @@ use std::sync::OnceLock;
 
 use crate::util::{create_private_dir, now_secs, open_private_append, rfc3339_utc};
 
-const ROTATE_BYTES: u64 = 2 << 20; // 與 hooks-debug.log 同門檻
+const ROTATE_BYTES: u64 = 2 << 20; // same threshold as hooks-debug.log
 
-// 等級僅是 severity 標記（供 grep 過濾 ERROR），不過濾輸出。
+// Levels are severity markers only (for grepping out ERROR); output is not filtered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     Error,
@@ -39,10 +47,12 @@ impl Level {
     }
 }
 
-// 模式（server|hook）由 process 啟動時指定，落在每行前綴供跨 process 對齊。
+// The mode (server|hook) is fixed at process start and prefixes every line for
+// cross-process alignment.
 static MODE: OnceLock<&'static str> = OnceLock::new();
 
-// init 標記本 process 的模式（server 或 hook）；未呼叫時 log() 仍可用，mode 記為 "?"。
+// init marks this process's mode (server or hook); without it, log() still
+// works and mode reads "?".
 pub fn init(mode: &'static str) {
     let _ = MODE.set(mode);
 }
@@ -65,7 +75,8 @@ fn log(level: Level, msg: &str) {
         level.name(),
         msg
     );
-    // 失敗哲學：寫不進去就丟棄——日誌缺席不可耽誤正事
+    // Failure philosophy: can't write → drop — a missing log must never hold
+    // up real work
     let _ = write_line(&log_path(), line.as_bytes());
 }
 
@@ -73,7 +84,8 @@ fn log_path() -> PathBuf {
     crate::util::data_dir().join("advisor.log")
 }
 
-// write_line：超過輪替門檻先 rotate，再以 O_APPEND 單次寫入整行。
+// write_line: rotate past the threshold first, then append the whole line with
+// a single O_APPEND write.
 fn write_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Ok(md) = std::fs::metadata(path) {
         if md.len() > ROTATE_BYTES {
@@ -87,10 +99,13 @@ fn write_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
-// rotate：改名保留一代（advisor.log.1）；改名失敗（例如被佔用）以 truncate 重開兜底。
-// 已知接受的 race：多 process 同時跨過輪替門檻時，後到者的 rename 可能覆掉剛搬去的
-// 世代（損失舊 .1，不損當前檔與行完整性）——發生窗口是 ns～µs 級且需兩 process
-// 同瞬間輪替，以「盡力而為」語義接受（靜默失敗哲學的延伸）。
+// rotate: rename keeping one generation (advisor.log.1); if the rename fails
+// (e.g. the file is held open), fall back to truncating and reopening. Known
+// accepted race: when multiple processes cross the rotation threshold at the
+// same instant, the later rename may clobber the just-moved generation (the
+// old .1 is lost; the current file and line integrity are not) — the window
+// is ns–µs wide and needs two processes rotating at the same instant;
+// accepted as best-effort (an extension of the silent-failure philosophy).
 fn rotate(path: &Path) {
     let mut prev = path.as_os_str().to_os_string();
     prev.push(".1");
@@ -130,7 +145,8 @@ mod tests {
         let dir = temp_log("rotate");
         let p = dir.join("advisor.log");
         log_to(&p, "first-line");
-        // 以 append 把檔案撐過輪替門檻（模擬長期累積；fs::write 會截斷不能用）
+        // grow the file past the rotation threshold via append (simulating
+        // long-term accumulation; fs::write truncates, so it can't be used)
         let junk = vec![b'x'; (ROTATE_BYTES + 1) as usize];
         #[cfg(unix)]
         {
@@ -140,9 +156,10 @@ mod tests {
             f.write_all(&junk).unwrap();
         }
         log_to(&p, "after-rotate");
-        // 整個舊檔（first-line + junk）搬到 .1；新檔只有 after-rotate
+        // the whole old file (first-line + junk) moves to .1; the new file
+        // holds only after-rotate
         let rotated = fs::read(dir.join("advisor.log.1")).unwrap();
-        assert!(rotated.starts_with(b"first-line\n"), "舊內容應保留在 .1");
+        assert!(rotated.starts_with(b"first-line\n"), "old content must survive in .1");
         assert!(rotated.len() > ROTATE_BYTES as usize);
         assert_eq!(fs::read_to_string(&p).unwrap(), "after-rotate\n");
         let _ = fs::remove_dir_all(&dir);
@@ -167,7 +184,7 @@ mod tests {
         }
         let content = fs::read_to_string(&p).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 200, "行數必須完整（無交錯損毀）");
+        assert_eq!(lines.len(), 200, "line count must be whole (no interleaved corruption)");
         let mut sorted = lines.clone();
         sorted.sort_unstable();
         let mut expect: Vec<String> = (0..4)

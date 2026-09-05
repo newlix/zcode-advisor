@@ -13,4 +13,4 @@ tokio = { version = "1", features = ["rt", "io-std", "io-util", "time", "sync"] 
 dirs = "6"
 
 [profile.release]
-strip = true # 發布 binary 去符號省體積；本專案不依賴符號化 backtrace
+strip = true # strip symbols from release binaries to save size; this project doesn't rely on symbolized backtraces

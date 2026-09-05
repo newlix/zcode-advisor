@@ -1,5 +1,6 @@
-// 對拍工具：對同一個 rollout 目錄輸出反查結果（SESSION/PREAMBLE/DIALOG），
-// 與 Go 版（~/.zcode/zcode-advisor）的對照 shim 逐位元組 diff：
+// Parity tool: prints the rollout-lookup result (SESSION/PREAMBLE/DIALOG) for
+// a given rollout directory, for byte-exact diffing against the retired Go
+// version's (~/.zcode/zcode-advisor) comparison shim:
 //   cargo run --release --example parity -- <rollout-dir> <question>
 use zcode_advisor::rollout::find_calling_session_in;
 

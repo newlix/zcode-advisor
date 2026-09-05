@@ -1,7 +1,10 @@
-// hook 模式：zcode-advisor hook <Event>，由 ZCode 的 hooks 機制以 stdin 餵入事件 JSON。
-// 只在規則抓得住的關鍵時刻諮詢顧問——任務開場（有份量的 prompt）與連續工具失敗（卡關），
-// 其餘事件一律靜默放行；顧問失敗也靜默放行，絕不擋工作。
-// 每個決策點都寫一行軌跡到 advisor.log（decision=… reason=…），供事後追查。
+// Hook mode: `zcode-advisor hook <Event>`, fed event JSON on stdin by ZCode's
+// hooks mechanism. The advisor is consulted only at rule-detectable key
+// moments — task opening (a substantial prompt) and consecutive tool failures
+// (stuck); every other event passes through silently, and advisor failures
+// also pass through silently — never block real work.
+// Every decision point writes one trace line to advisor.log (decision=…
+// reason=…) for post-hoc forensics.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -14,27 +17,27 @@ use crate::server::{ask_advisor, ADVISOR_MODEL};
 use crate::util::{create_private_dir, data_dir, now_secs, open_private_append, open_private_write, truncate};
 use crate::logger;
 
-const REMINDER_BUDGET: i64 = 3; // 每個 session 最多提醒幾次
-const OPEN_PROMPT_MIN_RUNES: usize = 40; // prompt 低於此長度視為瑣碎請求，不打擾
-const STUCK_FAIL_THRESHOLD: i64 = 2; // 連續失敗幾次視為卡關
-const STUCK_COOLDOWN_SECS: i64 = 5 * 60; // 兩次卡關診斷的最小間隔
-const STUCK_BUDGET: i64 = 5; // 每個 session 最多幾次卡關診斷
-const STATE_STALE_AFTER_SECS: i64 = 30 * 60; // 拿不到 session id 時的計數有效期
+const REMINDER_BUDGET: i64 = 3; // max reminders per session
+const OPEN_PROMPT_MIN_RUNES: usize = 40; // prompts shorter than this count as trivial; don't disturb
+const STUCK_FAIL_THRESHOLD: i64 = 2; // consecutive failures before counting as stuck
+const STUCK_COOLDOWN_SECS: i64 = 5 * 60; // minimum interval between two stuck diagnoses
+const STUCK_BUDGET: i64 = 5; // max stuck diagnoses per session
+const STATE_STALE_AFTER_SECS: i64 = 30 * 60; // how long counters stay valid when no session id is available
 
 pub fn run_hook(event: &str) {
     logger::init("hook");
-    // 上限 4MB，對應 Go 版 io.LimitReader(os.Stdin, 4<<20)
+    // 4MB cap, matching the Go version's io.LimitReader(os.Stdin, 4<<20)
     let mut stdin = Vec::new();
     let _ = std::io::stdin().take(4 << 20).read_to_end(&mut stdin);
-    debug_log(event, &stdin); // 「ZCode 餵了什麼」的原始擷取；行為軌跡見 advisor.log
+    debug_log(event, &stdin); // raw capture of "what ZCode fed us"; behavior traces go to advisor.log
 
-    let m: Value = serde_json::from_slice(&stdin).unwrap_or(Value::Null); // 解不動 → 全部查無值
+    let m: Value = serde_json::from_slice(&stdin).unwrap_or(Value::Null); // undecodable → treat all fields as missing
 
     match event {
         "UserPromptSubmit" => hook_user_prompt_submit(&m),
         "PostToolUseFailure" => hook_post_tool_use_failure(&m),
         "PostToolUseOK" => {
-            // 工具成功：重置連續失敗計數（零成本，不打 API）
+            // tool succeeded: reset the consecutive-failure counter (zero cost, no API call)
             let sess = session_key(&m);
             let mut st = load_state(&sess);
             st.fail = 0;
@@ -48,12 +51,14 @@ pub fn run_hook(event: &str) {
     }
 }
 
-// hookUserPromptSubmit：任務開場提醒——原版 nudge 的對應物。prompt 有份量且本 session
-// 尚未用過 consult_advisor 時注入一行提醒，不打 API、不等顧問；要不要問、何時問由主模型自己決定。
+// hookUserPromptSubmit: the task-opening reminder — counterpart of the original
+// nudge. Injects a one-line reminder when the prompt is substantial and
+// consult_advisor hasn't been used yet in this session; no API call, no waiting
+// on the advisor. Whether and when to ask stays with the main model.
 fn hook_user_prompt_submit(m: &Value) {
     let prompt = m.get("prompt").and_then(Value::as_str).unwrap_or("");
     let sess = session_key(m);
-    // Go 的 utf8.RuneCountInString ≡ chars().count()（不是 bytes 的 len()）
+    // Go's utf8.RuneCountInString ≡ chars().count() (not the byte count of len())
     if prompt.trim().chars().count() < OPEN_PROMPT_MIN_RUNES {
         logger::info(&format!(
             "hook event=UserPromptSubmit sess={sess} decision=silent reason=short-prompt(len<{})",
@@ -77,19 +82,23 @@ fn hook_user_prompt_submit(m: &Value) {
         "hook event=UserPromptSubmit sess={sess} decision=remind open={}/{}",
         st.open, REMINDER_BUDGET
     ));
-    // 文字仿原版 nudge：事實開頭＋條件式判準（不明的設計取捨／未排除的失敗模式）＋
-    // timing 教育（定位不算實質工作、定下做法前要問）。我們在 turn 0 注入，
-    // 靠文字教模型「先定位再問」，補原版 turn-2 nudge 的時點優勢。
+    // Text modeled on the original nudge: factual opening + conditional criteria
+    // (unclear design tradeoffs / failure modes not yet ruled out) + timing
+    // education (scoping isn't substantive work; ask before settling on an
+    // approach). We inject at turn 0 and teach the model through the text to
+    // "scope first, then ask", compensating for the original's turn-2 timing.
     emit_context(
         "UserPromptSubmit",
-        "【advisor 提醒】你還沒諮詢過 advisor（consult_advisor 工具：更強的顧問模型，\
-         呼叫時會自動附上你目前的完整對話）。定位工作可以先做——讀檔、搜尋、了解現況之後再問不遲；\
-         但如果任務有不明的設計取捨、或你尚未排除的失敗模式，請在定下做法、開始修改之前諮詢。\
-         卡住、考慮換方向、或自認完成時，也值得再問一次。",
+        "[advisor reminder] You haven't consulted the advisor yet (consult_advisor tool: a stronger advisor model; \
+         calling it automatically attaches your current full conversation). Scoping work first is fine — reading files, \
+         searching, and getting oriented before asking is never too late; but if the task has unclear design tradeoffs \
+         or failure modes you haven't ruled out, consult before settling on an approach and starting to edit. When stuck, \
+         considering a change of direction, or about to declare the task done, one more consult is also worth it.",
     );
 }
 
-// hookPostToolUseFailure：連續工具失敗 = 卡關訊號。達門檻才諮詢，有冷卻與預算。
+// hookPostToolUseFailure: consecutive tool failures = a stuck signal.
+// Consults only once the threshold is met, with a cooldown and a budget.
 fn hook_post_tool_use_failure(m: &Value) {
     let sess = session_key(m);
     let mut st = load_state(&sess);
@@ -127,7 +136,7 @@ fn hook_post_tool_use_failure(m: &Value) {
         STUCK_FAIL_THRESHOLD, STUCK_FAIL_THRESHOLD, st.stuck, STUCK_BUDGET
     ));
 
-    // 重新序列化成規範 JSON（鍵排序）
+    // Re-serialize to canonical JSON (sorted keys)
     let payload = serde_json::to_string(m).unwrap_or_else(|_| "null".into());
     let q = "A coding agent's tool calls keep failing; it appears stuck. Latest failed tool event (JSON):\n".to_string()
         + &truncate(&payload, 2000)
@@ -140,7 +149,7 @@ fn hook_post_tool_use_failure(m: &Value) {
                 started.elapsed(),
                 advice.len()
             ));
-            emit_context("PostToolUseFailure", &format!("【advisor 卡關建議 · {ADVISOR_MODEL}】\n{advice}"));
+            emit_context("PostToolUseFailure", &format!("[advisor stuck advice · {ADVISOR_MODEL}]\n{advice}"));
         }
         Err(e) => {
             eprintln!("advisor-hook: stuck advice skipped: {e}");
@@ -152,8 +161,9 @@ fn hook_post_tool_use_failure(m: &Value) {
     }
 }
 
-// emitContext 輸出 ZCode hook 的 additionalContext 格式；事件名錯了會被嚴格 schema 拒掉（無害）。
-// 寫入失敗（如管線已關）靜默吞掉——絕不因輸出問題 panic 或擋工作。
+// emitContext outputs ZCode's additionalContext hook format; a wrong event name
+// gets rejected by the strict schema (harmless). Write failures (e.g. a closed
+// pipe) are swallowed silently — never panic or block work over output problems.
 fn emit_context(event: &str, text: &str) {
     let out = json!({
         "hookSpecificOutput": {"hookEventName": event, "additionalContext": text}
@@ -163,18 +173,19 @@ fn emit_context(event: &str, text: &str) {
     let _ = stdout.flush();
 }
 
-// ---- session 狀態（計數用，壞了也只影響節流）----
-// 欄位名沿用 Go 版 hookState 的 json tags；計數用 i64＋飽和運算：
-// 被改壞的狀態檔最多讓計數失效，不該 panic。
+// ---- session state (counters only; corruption affects throttling at worst) ----
+// Field names follow the Go hookState json tags; counters use i64 + saturating
+// arithmetic: a corrupted state file can at worst invalidate the counts, never
+// panic.
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct HookState {
-    pub ts: i64,         // 最後寫入時間；default 案例靠它判斷新鮮度
-    pub open: i64,       // 提醒已發出次數
-    pub fail: i64,       // 連續工具失敗次數
-    pub stuck: i64,      // 卡關診斷已用次數
-    pub stuck_at: i64,   // 上次卡關診斷時間（unix 秒）
-    pub consulted: bool, // 本 session 是否已用過 consult_advisor（提醒收聲）
+    pub ts: i64,         // last write time; the "default" case judges freshness by it
+    pub open: i64,       // reminders emitted so far
+    pub fail: i64,       // consecutive tool failures
+    pub stuck: i64,      // stuck diagnoses used so far
+    pub stuck_at: i64,   // time of the last stuck diagnosis (unix seconds)
+    pub consulted: bool, // whether consult_advisor has been used in this session (silences the reminder)
 }
 
 fn state_path(sess: &str) -> PathBuf {
@@ -187,8 +198,9 @@ pub fn state_dir() -> PathBuf {
 
 fn load_state(sess: &str) -> HookState {
     let st = load_state_at(&state_path(sess));
-    // 新鮮度重置只適用於拿不到 session id 的 "default" 案例；
-    // 真實 session id 每次都是新的，計數不該跨 session 被誤清。
+    // The freshness reset applies only to the "default" case (no session id);
+    // real session ids are new every time, and their counters must not be
+    // cleared across sessions by mistake.
     if sess == "default" && now_secs().saturating_sub(st.ts) > STATE_STALE_AFTER_SECS {
         logger::info("state stale reset sess=default");
         return HookState::default();
@@ -197,9 +209,11 @@ fn load_state(sess: &str) -> HookState {
 }
 
 fn load_state_at(path: &Path) -> HookState {
-    // 對應 Go「json.Unmarshal 錯誤被忽略、保留已解到的欄位」的部分保鮮語義：
-    // 走 Value 逐欄盡力萃取，缺欄/null/型別不合回零值。
-    // 檔案存在但整體不是 JSON → 全零＋留痕（這會讓提醒重新發聲，值得可追查）
+    // Mirrors Go's partial-preservation semantics of "json.Unmarshal errors
+    // ignored, fields decoded so far kept": extract field by field via Value on
+    // a best-effort basis; missing/null/wrong-typed fields fall back to zero.
+    // File exists but isn't JSON at all → all zeros + a trace line (this lets
+    // the reminder speak again — worth being traceable)
     let raw = match fs::read(path) {
         Ok(b) => b,
         Err(_) => return HookState::default(),
@@ -235,14 +249,15 @@ fn save_state_at(path: &Path, st: &HookState) {
         if let Ok(mut f) = open_private_write(path) {
             let _ = f.write_all(&b);
         } else {
-            // 寫不進去 → 提醒不會收聲（下次再提醒）；ERROR 留痕供追查
+            // write failure → the reminder won't be silenced (fires again next
+            // time); ERROR trace for forensics
             logger::error(&format!("state write failed path={}", path.display()));
         }
     }
 }
 
-// sessionKey：env 的 CLAUDE_SESSION_ID 優先，其次 stdin 的 session_id，
-// 都沒有就用 "default"（靠 STATE_STALE_AFTER_SECS 避免跨 session 累計）。
+// sessionKey: env CLAUDE_SESSION_ID first, then stdin's session_id; neither
+// present → "default" (STATE_STALE_AFTER_SECS prevents cross-session buildup).
 fn session_key(m: &Value) -> String {
     let s = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
     let s = if s.is_empty() {
@@ -257,8 +272,9 @@ fn session_key(m: &Value) -> String {
     }
 }
 
-// markConsulted：MCP 工具被呼叫過即標記，開場提醒就此收聲。
-// 諮詢成敗都算數——提醒的目的是確認主模型知道工具存在，呼叫過就達成了。
+// markConsulted: mark on any MCP tool call; the opening reminder goes quiet
+// from then on. Success or failure both count — the reminder's purpose is to
+// make sure the main model knows the tool exists; a call achieves that.
 pub fn mark_consulted(session_id: &str) {
     if session_id.is_empty() {
         return;
@@ -269,8 +285,9 @@ pub fn mark_consulted(session_id: &str) {
     save_state(&k, &st);
 }
 
-// sanitizeSession：保留 [A-Za-z0-9._-]，其餘換 '_'，上限 64 位元組
-// （合法字元與替換字皆 1 byte，位元組數＝字元數）。
+// sanitizeSession: keep [A-Za-z0-9._-], replace everything else with '_', cap
+// at 64 bytes (legal chars and the replacement are all 1 byte, so bytes =
+// chars).
 fn sanitize_session(s: &str) -> String {
     let mut b = String::new();
     for r in s.chars() {
@@ -285,8 +302,9 @@ fn sanitize_session(s: &str) -> String {
     b
 }
 
-// debugLog：把每次 hook 的原始輸入留檔（「ZCode 餵了什麼」），供確認實際欄位名；
-// 超過 2MB 就輪替。行為軌跡在 advisor.log（logger 模組），兩者職責不同。
+// debugLog: archive every hook's raw input ("what ZCode fed us") to confirm
+// actual field names; rotates past 2MB. Behavior traces live in advisor.log
+// (the logger module) — different responsibilities.
 fn debug_log(event: &str, stdin: &[u8]) {
     let path = data_dir().join("hooks-debug.log");
     if let Ok(md) = fs::metadata(&path) {
@@ -318,19 +336,19 @@ mod tests {
         let st = HookState { ts: 1725500000, open: 2, fail: 1, stuck: 3, stuck_at: 1725490000, consulted: true };
         save_state_at(&path, &st);
         let raw = fs::read_to_string(&path).unwrap();
-        // 沿用 Go 版 json tags 的欄位名
+        // field names follow the Go json tags
         for key in [r#""ts":1725500000"#, r#""open":2"#, r#""fail":1"#, r#""stuck":3"#, r#""stuck_at":1725490000"#, r#""consulted":true"#] {
             assert!(raw.contains(key), "missing {key} in {raw}");
         }
         assert_eq!(load_state_at(&path), st);
-        // 部分/畸形狀態檔：比照 Go「保留已解到的欄位、其餘回零值」
+        // partial/malformed state file: like Go, "keep decoded fields, zero the rest"
         fs::write(&path, r#"{"open":2,"fail":-5,"consulted":"yes"}"#).unwrap();
         let st = load_state_at(&path);
         assert_eq!(st.open, 2);
         assert_eq!(st.fail, -5);
         assert_eq!(st.ts, 0);
         assert!(!st.consulted);
-        // null 欄位 = no-op（Go 語義），非缺失
+        // a null field is a no-op (Go semantics), not missing
         fs::write(&path, r#"{"open":2,"fail":null}"#).unwrap();
         assert_eq!(load_state_at(&path).open, 2);
         assert_eq!(load_state_at(&path).fail, 0);
@@ -341,23 +359,23 @@ mod tests {
     fn sanitize_matches_go_rules() {
         assert_eq!(sanitize_session("sess_abc-123.jsonl"), "sess_abc-123.jsonl");
         assert_eq!(sanitize_session("a/b\\c:d"), "a_b_c_d");
-        assert_eq!(sanitize_session("你好"), "__");
+        assert_eq!(sanitize_session("你好"), "__"); // CJK → '_' (intentionally multibyte)
         let long = "x".repeat(100);
         assert_eq!(sanitize_session(&long).len(), 64);
     }
 
     #[test]
     fn failure_threshold_and_cooldown_state_machine() {
-        // 直接驗證 hookPostToolUseFailure 的計數邏輯（不打 API 的前置路徑）
+        // Verify the hookPostToolUseFailure counting logic directly (pre-API path, no API call)
         let sess = sanitize_session("smoke-sm-1");
         let path = state_path(&sess);
         let _ = fs::remove_file(&path);
 
         let mut st = load_state(&sess);
         st.fail += 1;
-        assert!(st.fail < STUCK_FAIL_THRESHOLD); // 第一次失敗：未達門檻
+        assert!(st.fail < STUCK_FAIL_THRESHOLD); // first failure: below threshold
         st.fail += 1;
-        assert!(st.fail >= STUCK_FAIL_THRESHOLD); // 第二次：達門檻
+        assert!(st.fail >= STUCK_FAIL_THRESHOLD); // second: threshold met
         st.fail = 0;
         st.stuck += 1;
         st.stuck_at = now_secs();
@@ -365,7 +383,7 @@ mod tests {
 
         let st2 = load_state(&sess);
         assert_eq!(st2.stuck, 1);
-        assert!(now_secs() - st2.stuck_at < STUCK_COOLDOWN_SECS); // 冷卻中
+        assert!(now_secs() - st2.stuck_at < STUCK_COOLDOWN_SECS); // within cooldown
         let _ = fs::remove_file(&path);
     }
 }

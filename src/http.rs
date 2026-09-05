@@ -1,26 +1,30 @@
-// 手寫的極簡 HTTP/1.1 client：只服務 advisor 對本機 Ollama（純 HTTP、固定端點）的
-// 單發 POST。Rust std 沒有 HTTP client，為了不引入重依賴（Go 版靠 net/http），
-// 這裡直接走 TcpStream，換取與 Go 版相同的「單 binary、近乎零依賴」性質。
+// A minimal hand-written HTTP/1.1 client: it only serves the advisor's
+// one-shot POST to the local Ollama (plain HTTP, fixed endpoint). Rust's std
+// has no HTTP client, and to avoid a heavy dependency (the Go version relied
+// on net/http) this goes straight to TcpStream, preserving the same "single
+// binary, nearly zero dependencies" property.
 //
-// Go 版的 context.WithTimeout 是「整個請求」的 deadline，而 set_read_timeout 只
-// 約束單次 syscall——慢速滴漏回應會讓總時長超標，因此全程以 Instant deadline
-// 在每次讀寫前重算剩餘時間。回應 body 上限 1MB，對應 Go 版的 io.LimitReader。
+// Go's context.WithTimeout is a deadline over the whole request, while
+// set_read_timeout bounds only a single syscall — a slow-drip response could
+// overshoot the total. So an Instant deadline recalculates the remaining time
+// before every read/write. The response body is capped at 1MB, matching the
+// Go version's io.LimitReader.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-const MAX_BODY_BYTES: usize = 1 << 20; // 與 Go 版 io.LimitReader(resp.Body, 1<<20) 對齊
-const MAX_CHUNK: usize = 1 << 22; // 單一 chunk 上限（防禦值；Ollama 遠低於此）
+const MAX_BODY_BYTES: usize = 1 << 20; // aligned with the Go version's io.LimitReader(resp.Body, 1<<20)
+const MAX_CHUNK: usize = 1 << 22; // per-chunk cap (defensive; Ollama is far below this)
 
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
-    pub body: Vec<u8>, // 至多 MAX_BODY_BYTES（超過就截斷，交由上層 JSON 解析報錯）
+    pub body: Vec<u8>, // at most MAX_BODY_BYTES (truncated beyond that; the upper layer's JSON parse then reports it)
 }
 
-// post_json：POST application/json。任何失敗以 Err(String) 回傳，
-// 呼叫端（ask_advisor）統一包成「advisor API unreachable」。
+// post_json: POST application/json. Any failure returns Err(String); the
+// caller (ask_advisor) uniformly wraps it as "advisor API unreachable".
 pub fn post_json(url: &str, body: &str, timeout: Duration) -> Result<HttpResponse, String> {
     let deadline = Instant::now() + timeout;
 
@@ -31,7 +35,7 @@ pub fn post_json(url: &str, body: &str, timeout: Duration) -> Result<HttpRespons
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    // 只需涵蓋 host:port；不處理 IPv6 bracket 形式（端點寫死是 localhost）
+    // host:port is all we need; IPv6 bracket forms are not handled (the endpoint is hard-coded localhost)
     let (host, port) = match host_port.rsplit_once(':') {
         Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
             (h, p.parse::<u16>().map_err(|e| format!("invalid port: {e}"))?)
@@ -66,7 +70,7 @@ pub fn post_json(url: &str, body: &str, timeout: Duration) -> Result<HttpRespons
     );
     write_all_deadline(&mut stream, req.as_bytes(), deadline).map_err(|e| translate_io(&e, timeout))?;
 
-    // ---- 讀回應 ----
+    // ---- read the response ----
     let mut raw: Vec<u8> = Vec::new();
     let header_end = loop {
         if let Some(pos) = find(&raw, b"\r\n\r\n") {
@@ -109,11 +113,11 @@ pub fn post_json(url: &str, body: &str, timeout: Duration) -> Result<HttpRespons
         } else if let Some(n) = content_length {
             while body.len() < n.min(MAX_BODY_BYTES) {
                 if !fill(&mut stream, &mut body, deadline).map_err(|e| translate_io(&e, timeout))? {
-                    break; // 提前 EOF：交給上層 JSON 解析報錯（與 Go 版同路徑）
+                    break; // early EOF: the upper layer's JSON parse reports it (same path as the Go version)
                 }
             }
         } else {
-            // Connection: close 且無 Content-Length：讀到 EOF 或上限
+            // Connection: close with no Content-Length: read to EOF or the cap
             while body.len() < MAX_BODY_BYTES {
                 if !fill(&mut stream, &mut body, deadline).map_err(|e| translate_io(&e, timeout))? {
                     break;
@@ -125,13 +129,15 @@ pub fn post_json(url: &str, body: &str, timeout: Duration) -> Result<HttpRespons
     Ok(HttpResponse { status, body })
 }
 
-// read_chunked：解 Transfer-Encoding: chunked（Ollama 非串流回應通常給
-// Content-Length，但不保證）。到達 body 上限即停，模擬 Go 版 LimitReader 的截斷。
+// read_chunked: decode Transfer-Encoding: chunked (Ollama's non-streaming
+// responses usually give Content-Length, but that's not guaranteed). Stops at
+// the body cap, mimicking the Go LimitReader's truncation.
 fn read_chunked(stream: &mut TcpStream, mut buf: Vec<u8>, deadline: Instant) -> Result<Vec<u8>, std::io::Error> {
     let mut out = Vec::new();
     loop {
         while find(&buf, b"\r\n").is_none() {
-            // size 行掃描設上限（Go 的 chunked reader 對超長行會早停），防無限緩衝
+            // cap the size-line scan (Go's chunked reader bails early on
+            // overlong lines) to prevent unbounded buffering
             if buf.len() > MAX_BODY_BYTES {
                 return Err(invalid_data("chunk size line too long"));
             }
@@ -145,7 +151,7 @@ fn read_chunked(stream: &mut TcpStream, mut buf: Vec<u8>, deadline: Instant) -> 
             .map_err(|_| invalid_data("malformed chunk size"))?;
         buf.drain(..pos + 2);
         if size == 0 {
-            return Ok(out); // terminal chunk；trailer 罕見，直接丟棄（Connection: close）
+            return Ok(out); // terminal chunk; trailers are rare, just discard them (Connection: close)
         }
         if size > MAX_CHUNK {
             return Err(invalid_data("chunk too large"));
@@ -166,8 +172,9 @@ fn read_chunked(stream: &mut TcpStream, mut buf: Vec<u8>, deadline: Instant) -> 
     }
 }
 
-// fill：讀一輪進 buf；回傳 false 代表 EOF。每次讀前把剩餘 deadline 設成
-// read timeout——這是 Go ctx-timeout 語義的代替品。
+// fill: read one round into buf; false means EOF. The remaining deadline is
+// set as the read timeout before every read — the stand-in for Go's
+// ctx-timeout semantics.
 fn fill(stream: &mut TcpStream, buf: &mut Vec<u8>, deadline: Instant) -> Result<bool, std::io::Error> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -181,7 +188,7 @@ fn fill(stream: &mut TcpStream, buf: &mut Vec<u8>, deadline: Instant) -> Result<
             buf.extend_from_slice(&tmp[..n]);
             Ok(true)
         }
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(true), // 重試
+        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(true), // retry
         Err(e) => Err(e),
     }
 }
@@ -245,7 +252,7 @@ mod tests {
 
     fn serve_content_length(mut s: TcpStream) {
         let mut buf = [0u8; 4096];
-        let _ = s.read(&mut buf); // 請求整包通常一次讀完，測試用途足夠
+        let _ = s.read(&mut buf); // the whole request usually arrives in one read; good enough for tests
         let body = r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}]}"#;
         let _ = write!(
             s,
@@ -271,11 +278,11 @@ mod tests {
         let mut buf = [0u8; 4096];
         let _ = s.read(&mut buf);
         let _ = write!(s, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nplain text error");
-        // drop(s) 關連線 → close-delimited body
+        // drop(s) closes the connection → close-delimited body
     }
 
     fn serve_silent(_s: TcpStream) {
-        std::thread::sleep(Duration::from_secs(10)); // 永不回應
+        std::thread::sleep(Duration::from_secs(10)); // never responds
     }
 
     #[test]
@@ -315,8 +322,9 @@ mod tests {
 
     #[test]
     fn connects_via_localhost_name_when_ipv6_unavailable() {
-        // localhost 可能解析出 ::1 與 127.0.0.1（順序依系統而異）；server 只綁
-        // 127.0.0.1 時，client 必須逐一嘗試所有位址（同 Go dialer）而非只試第一個
+        // localhost may resolve to both ::1 and 127.0.0.1 (order varies by
+        // system); when the server binds only 127.0.0.1, the client must try
+        // every address in turn (like the Go dialer), not just the first
         let port = spawn_server(serve_content_length);
         let resp = post_json(&format!("http://localhost:{port}/v1/x"), "{}", Duration::from_secs(5)).unwrap();
         assert_eq!(resp.status, 200);
@@ -329,17 +337,18 @@ mod tests {
 
     #[test]
     fn chunked_size_line_capped() {
-        // size 行無止盡（無 CRLF）→ 不得無限緩衝，超過 1MB 即報錯（防 OOM）
+        // an endless size line (no CRLF) → must not buffer forever; error past
+        // 1MB (OOM guard)
         fn serve(mut s: TcpStream) {
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf);
             let _ = write!(s, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
             let mut sent = 0usize;
-            let chunk = [b'z'; 65536]; // 非十六進位、無 CRLF
+            let chunk = [b'z'; 65536]; // non-hex, no CRLF
             while sent < 4 << 20 {
                 let n = chunk.len().min((4 << 20) - sent);
                 if s.write_all(&chunk[..n]).is_err() {
-                    break; // client 已斷開（上限觸發）
+                    break; // client hung up (cap tripped)
                 }
                 sent += n;
             }

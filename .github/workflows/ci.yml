@@ -1,4 +1,4 @@
-# 持續驗證：測試 + 跨平台編譯（不發布）。發布流程見 release.yml（tag 觸發）。
+# Continuous verification: tests + cross-platform builds (no publishing). The release pipeline lives in release.yml (tag-triggered).
 name: ci
 on:
   push:

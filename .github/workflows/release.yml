@@ -1,7 +1,8 @@
-# 發布流程：推 v* tag 時為五個平台建置 binary，連同 checksums 附到 GitHub Release。
-# 命名：zcode-advisor-<tag>-<target>.tar.gz（Windows 為 .zip）
-# Linux 用 musl 靜態連結（任何發行版可直接跑）；aarch64 交叉編譯用 rust-lld
-#（無 C 依賴，self-contained musl，已在本地與 CI 驗證）。
+# Release pipeline: pushing a v* tag builds binaries for five platforms and
+# attaches them, with checksums, to a GitHub Release.
+# Naming: zcode-advisor-<tag>-<target>.tar.gz (.zip on Windows)
+# Linux uses static musl linking (runs on any distro); aarch64 cross-compiles with rust-lld
+# (no C dependencies, self-contained musl; verified locally and in CI).
 name: release
 on:
   push:
@@ -15,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: tag 與 Cargo.toml 版本必須一致（防忘記 bump 就 tag）
+      - name: tag must match the Cargo.toml version (guards against tagging before bumping)
         run: |
           v="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)"
           [ "$v" = "${{ github.ref_name }}" ] || { echo "mismatch: tag=${{ github.ref_name }} Cargo.toml=$v"; exit 1; }
