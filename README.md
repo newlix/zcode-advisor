@@ -97,7 +97,7 @@ state 檔與日誌落在各 OS 慣例的資料目錄（見「記錄與追查」�
 
 **顧問行為的所有設定都在原始碼**：模型／端點／輸出上限 `MAX_TOKENS`（kimi-k3 建議值 131072；reasoning 模型的推理文字計入 max_tokens，預算太小會在推理階段燒光、正文為空）／諮詢上限 `MAX_USES` 在 `src/server.rs`；對話帶入上限 `ROLLOUT_TAIL` 在 `src/rollout.rs`；節流常數（提醒上限 3 次/session、prompt ≥40 字才提醒、卡關門檻連續 2 次失敗、冷卻 5 分鐘、卡關預算 5 次/session）在 `src/hooks.rs`。要調就改常數重編。
 
-執行期不讀任何行為配置；環境變數只有開發與環境偵測兩類：`ADVISOR_LOG`（見「記錄與追查」，不認得的值一律視為 `info`）、`CLAUDE_SESSION_ID`（ZCode 注入的 session 識別）、以及各平台的標準目錄變數（`HOME`/`USERPROFILE`、`XDG_DATA_HOME`/`LOCALAPPDATA`，由 dirs 解析）。
+執行期不讀任何設定，也沒有環境變數旋鈕——唯一的環境輸入是 ZCode 注入的 `CLAUDE_SESSION_ID`（session 識別）與各平台的標準目錄變數（`HOME`/`USERPROFILE`、`XDG_DATA_HOME`/`LOCALAPPDATA`，由 dirs 解析資料目錄）。
 
 ## 檔案
 
@@ -106,7 +106,7 @@ state 檔與日誌落在各 OS 慣例的資料目錄（見「記錄與追查」�
 - `src/hooks.rs` — 三個 hook 處理器、session 狀態檔（`state/<sess>.state.json`：提醒/失敗/卡關/已諮詢計數）、提醒文字；輸出格式沿用 Go 版 `hooks.go`
 - `src/rollout.rs` — UUID 反查、對話壓縮、當前輪獨白抽取；與 Go 版 `rollout.go` 行為一致（fixture 逐位元組對拍驗證）
 - `src/http.rs` — 手寫 HTTP/1.1 client（顧問端點是 localhost 純 HTTP；deadline 語義、Content-Length/chunked/close-delimited、1MB body 上限）。rmcp 只提供 MCP transport，對 Ollama 的單發純 HTTP 呼叫不值得再拉 reqwest
-- `src/logger.rs` — 行為軌跡日誌（advisor.log）：等級過濾、2MB 輪替保留一代、O_APPEND 單行寫入的多 process 並發安全、寫檔失敗靜默
+- `src/logger.rs` — 行為軌跡日誌（advisor.log）：severity 標記、2MB 輪替保留一代、O_APPEND 單行寫入的多 process 並發安全、寫檔失敗靜默
 - `src/util.rs` — 共用工具：char-boundary 安全的 truncate、跨平台資料目錄（dirs）、RFC3339 UTC、私有權限開檔
 - `examples/parity.rs` — 對拍工具：輸出 rollout 反查結果，供與 Go 版逐位元組 diff
 
@@ -126,7 +126,7 @@ state 檔與日誌落在各 OS 慣例的資料目錄（見「記錄與追查」�
 - **`hooks-debug.log`**——原始擷取：「ZCode 餵了什麼」（每次 hook 的完整 stdin，超過 2MB 重開）。確認 ZCode 實際欄位名用。
 - **`state/<sess>.state.json`**——hook 節流計數（提醒/失敗/卡關/已諮詢）。
 
-**等級**：`ADVISOR_LOG` 環境變數（`debug|info|error`，預設 `info`）——本專案唯一的環境變數，純開發用途。`debug` 額外記錄完整 question、送出的 context 位元組數、advice 開頭 200 字（重現顧問看到什麼）。檔案為 0600（unix）且在使用者自家目錄；內容含對話片段，與 hooks-debug.log 同一隱私邊界。
+**等級**：只有 INFO/ERROR 兩種 severity 標記（供 grep 過濾 ERROR），全時全開，**零配置零開關**——行為軌跡本來就該全記；內容重現走 rollout 檔（見下）。檔案為 0600（unix）且在使用者自家目錄。
 
 ## 與 Go 版的差異
 
@@ -164,6 +164,13 @@ cargo test
 
 # hook（不打 API；輸出與 Go版 byte-identical）
 echo '{"prompt":"…40字以上的任務描述…","session_id":"s1"}' | ./target/release/zcode-advisor hook UserPromptSubmit
+```
+
+**內容重現**：advisor.log 只記結構軌跡（決策、結果、時間、大小），不記內容——「顧問到底看到什麼」（完整 question、對話視野、建議本文）由 ZCode 的 rollout 檔原生保存且永久可查：
+
+```bash
+# 找出某次 consult 的完整提問與回覆（question 在 toolCall input、建議在下一輪的 tool result）
+grep -l consult_advisor ~/.zcode/cli/rollout/model-io-sess_*.jsonl | tail -5
 ```
 
 疑難排解：hook 沒觸發 → 先確認 `hooks.enabled: true`，再看 `hooks-debug.log` 有無記錄（有 config 問題參照 ZCode 的 diagnosing-hooks 指南）；MCP 連不上 → Settings → MCP 看狀態，config-file server 的 schema 是嚴格的（未知欄位會整個被丟棄）、路徑必須絕對。

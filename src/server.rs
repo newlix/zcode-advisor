@@ -200,10 +200,8 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
         };
         session_note = format!(" | session {short}");
     }
-    logger::debug(&format!(
-        "advisor request question={question:?} ctx={}B",
-        advice_context.len()
-    ));
+    // 「顧問看到什麼」的內容（完整 question、對話、建議）由 ZCode 的 rollout 檔
+    // 原生保存，日誌只記結構軌跡
     match ask_advisor(question, &advice_context) {
         Err(e) => {
             logger::info(&format!(
@@ -220,7 +218,6 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
                 advice_context.len(),
                 advice.len()
             ));
-            logger::debug(&format!("advice head={:?}", crate::util::truncate(&advice, 200)));
             CallToolResult::success(vec![ContentBlock::text(format!(
                 "[advisor · {}{session_note}]\n{advice}",
                 advisor_label()

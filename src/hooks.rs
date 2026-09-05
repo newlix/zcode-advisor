@@ -235,8 +235,8 @@ fn save_state_at(path: &Path, st: &HookState) {
         if let Ok(mut f) = open_private_write(path) {
             let _ = f.write_all(&b);
         } else {
-            // 寫不進去 → 提醒不會收聲（下次再提醒）；留痕供追查
-            logger::debug(&format!("state write failed path={}", path.display()));
+            // 寫不進去 → 提醒不會收聲（下次再提醒）；ERROR 留痕供追查
+            logger::error(&format!("state write failed path={}", path.display()));
         }
     }
 }

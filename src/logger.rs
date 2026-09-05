@@ -2,15 +2,18 @@
 // （原始 stdin 擷取），這邊記「我們做了什麼、為什麼」（consult 生命週期、
 // hook 決策點）。目的是事後追查：顧問為什麼這樣回答、hook 為什麼觸發／沒觸發。
 //
+// 只有結構性軌跡（決策、結果、時間、大小），不記內容——「顧問到底看到什麼」
+// （完整 question、對話、建議本文）由 ZCode 的 rollout 檔原生保存
+// （~/.zcode/cli/rollout/），事後永遠可重現，日誌不重複捕。
+//
 // 設計約束：
 // - 記錄系統絕不能讓任務失敗：任何寫檔錯誤靜默丟棄（同 hooks-debug 哲學）。
 // - 多 process 並發（兩條 MCP 連線＋一次性的 hook process）：O_APPEND＋
 //   單一 write_all（行長遠小於 page size）保持行完整；每行開檔即關，
 //   頻率極低（每次 consult／hook 一兩行），無需持有檔案。
 // - stdout 永遠不留痕跡（MCP 協議通道）；stderr 的既有行照舊，這裡只寫檔案。
-//
-// 等級由 ADVISOR_LOG 環境變數控制（debug|info|error，預設 info）——本專案唯一
-// 的環境變數，純開發用途，執行行為不受影響。
+// - 無等級開關、無環境變數：兩個等級（INFO/ERROR）都是severity標記，
+//   全時全開——行為軌跡的量本來就該全記，內容另有歸宿。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,11 +23,11 @@ use crate::util::{create_private_dir, now_secs, open_private_append, rfc3339_utc
 
 const ROTATE_BYTES: u64 = 2 << 20; // 與 hooks-debug.log 同門檻
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+// 等級僅是 severity 標記（供 grep 過濾 ERROR），不過濾輸出。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
-    Error = 0,
-    Info = 1,
-    Debug = 2,
+    Error,
+    Info,
 }
 
 impl Level {
@@ -32,39 +35,20 @@ impl Level {
         match self {
             Level::Error => "ERROR",
             Level::Info => "INFO",
-            Level::Debug => "DEBUG",
-        }
-    }
-
-    fn parse(s: &str) -> Level {
-        match s.to_ascii_lowercase().as_str() {
-            "debug" => Level::Debug,
-            "error" => Level::Error,
-            _ => Level::Info, // 含未設、空值、不認得的值
         }
     }
 }
 
-// 模式（server|hook）由 process 啟動時指定；等級讀一次環境變數即固化。
+// 模式（server|hook）由 process 啟動時指定，落在每行前綴供跨 process 對齊。
 static MODE: OnceLock<&'static str> = OnceLock::new();
-static MAX_LEVEL: OnceLock<Level> = OnceLock::new();
 
 // init 標記本 process 的模式（server 或 hook）；未呼叫時 log() 仍可用，mode 記為 "?"。
 pub fn init(mode: &'static str) {
     let _ = MODE.set(mode);
-    let _ = MAX_LEVEL.set(Level::parse(&std::env::var("ADVISOR_LOG").unwrap_or_default()));
-}
-
-fn max_level() -> Level {
-    *MAX_LEVEL.get_or_init(|| Level::parse(&std::env::var("ADVISOR_LOG").unwrap_or_default()))
 }
 
 pub fn info(msg: &str) {
     log(Level::Info, msg);
-}
-
-pub fn debug(msg: &str) {
-    log(Level::Debug, msg);
 }
 
 pub fn error(msg: &str) {
@@ -72,9 +56,6 @@ pub fn error(msg: &str) {
 }
 
 fn log(level: Level, msg: &str) {
-    if level > max_level() {
-        return;
-    }
     let mode = *MODE.get().unwrap_or(&"?");
     let line = format!(
         "{} pid={} mode={} {} {}\n",
@@ -131,15 +112,6 @@ mod tests {
 
     fn log_to(path: &Path, msg: &str) {
         write_line(path, format!("{}\n", msg).as_bytes()).unwrap();
-    }
-
-    #[test]
-    fn level_parse_defaults_to_info() {
-        assert_eq!(Level::parse("debug"), Level::Debug);
-        assert_eq!(Level::parse("ERROR"), Level::Error);
-        assert_eq!(Level::parse(""), Level::Info);
-        assert_eq!(Level::parse("nonsense"), Level::Info);
-        assert!(Level::Error < Level::Info && Level::Info < Level::Debug);
     }
 
     #[test]
