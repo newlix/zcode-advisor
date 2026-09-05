@@ -1,0 +1,67 @@
+# 發布流程：推 v* tag 時為五個平台建置 binary，連同 checksums 附到 GitHub Release。
+# 命名：zcode-advisor-<tag>-<target>.tar.gz（Windows 為 .zip）
+# Linux 用 musl 靜態連結（任何發行版可直接跑）；aarch64 交叉編譯用 rust-lld
+#（無 C 依賴，self-contained musl，已在本地與 CI 驗證）。
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            rustflags: -C linker=rust-lld
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: tar -czf zcode-advisor-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release zcode-advisor
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target\${{ matrix.target }}\release\zcode-advisor.exe -DestinationPath zcode-advisor-${{ github.ref_name }}-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: zcode-advisor-*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: checksums
+        run: sha256sum zcode-advisor-* | tee checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            zcode-advisor-*
+            checksums.txt
+          generate_release_notes: true

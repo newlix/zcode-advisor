@@ -39,15 +39,42 @@ ZCode 為每個 session 在 `~/.zcode/cli/rollout/model-io-sess_<uuid>.jsonl` �
 
 `question` 參數保留作「聚焦透鏡」——比原版的空輸入多了焦點。
 
-## 建置與安裝
+## 安裝
 
-安裝到 `/usr/local/bin`（ZCode config 不展開 `~`，固定絕對路徑可跨機通用）：
+三種方式，擇一。安裝目標 `/usr/local/bin`（ZCode config 不展開 `~`，固定絕對路徑可跨機通用）。
+
+**1. 下載預建 binary**（[Releases](https://github.com/newlix/zcode-advisor/releases)，隨 `v*` tag 自動建置）：
+
+| 平台 | 資產檔名（`<ver>` 為 tag） |
+|---|---|
+| Linux x86_64（任何發行版，musl 靜態） | `zcode-advisor-<ver>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64（musl 靜態） | `zcode-advisor-<ver>-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Apple Silicon | `zcode-advisor-<ver>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `zcode-advisor-<ver>-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `zcode-advisor-<ver>-x86_64-pc-windows-msvc.zip` |
 
 ```bash
-cd ~/github/newlix/zcode-advisor
-cargo build --release               # Rust 1.91+；依賴：rmcp + tokio + serde（約 80 個 crate）
+curl -LO https://github.com/newlix/zcode-advisor/releases/latest/download/zcode-advisor-<ver>-x86_64-unknown-linux-musl.tar.gz
+tar -xzf zcode-advisor-*.tar.gz && sudo install -m 0755 zcode-advisor /usr/local/bin/zcode-advisor
+```
+
+（下載後以 Release 附的 `checksums.txt` 驗證。）
+
+**2. cargo 從 git 安裝**（需 Rust 1.91+）：
+
+```bash
+cargo install --git https://github.com/newlix/zcode-advisor
+```
+
+**3. 從原始碼建置**：
+
+```bash
+git clone https://github.com/newlix/zcode-advisor && cd zcode-advisor
+cargo build --release
 sudo install -m 0755 target/release/zcode-advisor /usr/local/bin/zcode-advisor
 ```
+
+（Windows 安裝位置自定，`~\.zcode\cli\config.json` 的 command 記得指到絕對路徑。）
 
 state 檔與日誌落在各 OS 慣例的資料目錄（見「記錄與追查」）。與 Go 版脫鉤：不做舊 state 移轉（計數是短命的節流資料，重置最多多一次提醒），Go 遺留目錄 `~/.zcode/zcode-advisor/` 留給 Go 版原封不動。
 

@@ -1,0 +1,27 @@
+# 持續驗證：測試 + 跨平台編譯（不發布）。發布流程見 release.yml（tag 觸發）。
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - run: cargo test --release
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo build --release --target aarch64-unknown-linux-musl
+        env:
+          RUSTFLAGS: -C linker=rust-lld
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --release
