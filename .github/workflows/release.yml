@@ -11,7 +11,17 @@ permissions:
   contents: write
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag 與 Cargo.toml 版本必須一致（防忘記 bump 就 tag）
+        run: |
+          v="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          [ "$v" = "${{ github.ref_name }}" ] || { echo "mismatch: tag=${{ github.ref_name }} Cargo.toml=$v"; exit 1; }
+
   build:
+    needs: guard
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +44,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
       - name: package (unix)

@@ -13,9 +13,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
-      - run: cargo test --release
-      - run: cargo build --release --target x86_64-unknown-linux-musl
-      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target aarch64-unknown-linux-musl
         env:
           RUSTFLAGS: -C linker=rust-lld
 
@@ -24,4 +24,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --release
+      - run: cargo check --release --locked

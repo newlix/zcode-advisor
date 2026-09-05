@@ -1,8 +1,9 @@
 [package]
 name = "zcode-advisor"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"
 description = "ZCode advisor tool: MCP stdio server (rmcp) + hooks"
+license = "MIT"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
