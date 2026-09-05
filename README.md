@@ -2,7 +2,7 @@
 
 ZCode 版的 [Anthropic advisor tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool)：讓便宜快速的執行模型（glm-5.3-flash）在關鍵時刻向更強的顧問模型徵詢戰略建議（顧問固定為本機 Ollama 的 `kimi-k3:cloud`，模型與端點寫死在 `src/server.rs` 常數）。單一 binary、兩種模式（MCP stdio server / hook）。
 
-**MCP 協議層使用官方 [rmcp](https://crates.io/crates/rmcp) SDK**（spec 2026-07-28 慣例：`#[tool_router]`/`#[tool_handler]`、tokio current-thread runtime、stdio transport）。advisor 功能（顧問降級語義、輸出上限、時機教育）與 Go 版（`~/.zcode/zcode-advisor`）等義；**hook 層（提醒/卡關/狀態檔）與 Go 版逐位元組互通**——hook 與 state 直接換裝無縫接軌，MCP wire 回應則為 rmcp 標準形狀（spec 合規，ZCode 無感）。
+**MCP 協議層使用官方 [rmcp](https://crates.io/crates/rmcp) SDK**（spec 2026-07-28 慣例：`#[tool_router]`/`#[tool_handler]`、tokio current-thread runtime、stdio transport）。advisor 功能（顧問降級語義、輸出上限、時機教育）與 Go 版（`~/.zcode/zcode-advisor`，已退役）等義；hook 的輸出格式（提醒文字、additionalContext）與 rollout 反查逐位元組一致，但執行期資料（state、日誌）已移至跨平台資料目錄、與 Go 遺留目錄分家（見「記錄與追查」）。
 
 ## 系統組成
 
@@ -49,7 +49,7 @@ cargo build --release               # Rust 1.91+；依賴：rmcp + tokio + serde
 sudo install -m 0755 target/release/zcode-advisor /usr/local/bin/zcode-advisor
 ```
 
-state 檔（`~/.zcode/zcode-advisor/state/`）與 Go 版同一格式、同一位置——換裝後計數延續，無需遷移。
+state 檔與日誌落在各 OS 慣例的資料目錄（見「記錄與追查」）。與 Go 版脫鉤：不做舊 state 移轉（計數是短命的節流資料，重置最多多一次提醒），Go 遺留目錄 `~/.zcode/zcode-advisor/` 留給 Go 版原封不動。
 
 在 `~/.zcode/cli/config.json` 註冊（hooks 必須 `hooks.enabled: true`；與 Go 版完全相同的設定）：
 
@@ -95,24 +95,44 @@ state 檔（`~/.zcode/zcode-advisor/state/`）與 Go 版同一格式、同一位
 
 唯一後端：本機 Ollama 的 OpenAI 相容端點，模型 `kimi-k3:cloud`（Ollama 的雲端託管模型，走 Ollama 帳號計費，非本地 GGUF——`ollama pull` 拉不下來、`/api/tags` 也看不到它）。**不需要任何 API key**，但需先 `ollama login` 且本機 `ollama serve` 在跑。
 
-**所有設定都在原始碼**，沒有任何環境變數或 config 旋鈕：模型／端點／輸出上限 `MAX_TOKENS`（kimi-k3 建議值 131072；reasoning 模型的推理文字計入 max_tokens，預算太小會在推理階段燒光、正文為空）／諮詢上限 `MAX_USES` 在 `src/server.rs`；對話帶入上限 `ROLLOUT_TAIL` 在 `src/rollout.rs`；節流常數（提醒上限 3 次/session、prompt ≥40 字才提醒、卡關門檻連續 2 次失敗、冷卻 5 分鐘、卡關預算 5 次/session）在 `src/hooks.rs`。要調就改常數重編。
+**顧問行為的所有設定都在原始碼**：模型／端點／輸出上限 `MAX_TOKENS`（kimi-k3 建議值 131072；reasoning 模型的推理文字計入 max_tokens，預算太小會在推理階段燒光、正文為空）／諮詢上限 `MAX_USES` 在 `src/server.rs`；對話帶入上限 `ROLLOUT_TAIL` 在 `src/rollout.rs`；節流常數（提醒上限 3 次/session、prompt ≥40 字才提醒、卡關門檻連續 2 次失敗、冷卻 5 分鐘、卡關預算 5 次/session）在 `src/hooks.rs`。要調就改常數重編。
+
+執行期不讀任何行為配置；環境變數只有開發與環境偵測兩類：`ADVISOR_LOG`（見「記錄與追查」，不認得的值一律視為 `info`）、`CLAUDE_SESSION_ID`（ZCode 注入的 session 識別）、以及各平台的標準目錄變數（`HOME`/`USERPROFILE`、`XDG_DATA_HOME`/`LOCALAPPDATA`，由 dirs 解析）。
 
 ## 檔案
 
 - 執行檔安裝在 `/usr/local/bin/zcode-advisor`；原始碼在本目錄
 - `src/server.rs` — rmcp MCP server：`Advisor` handler、`consult_advisor` 工具（spawn_blocking + 串行化）、`ask_advisor`（打本機 Ollama 的 OpenAI 相容端點）、模型常數
-- `src/hooks.rs` — 三個 hook 處理器、session 狀態檔（`state/<sess>.state.json`：提醒/失敗/卡關/已諮詢計數）、提醒文字；與 Go 版 `hooks.go` 互通
+- `src/hooks.rs` — 三個 hook 處理器、session 狀態檔（`state/<sess>.state.json`：提醒/失敗/卡關/已諮詢計數）、提醒文字；輸出格式沿用 Go 版 `hooks.go`
 - `src/rollout.rs` — UUID 反查、對話壓縮、當前輪獨白抽取；與 Go 版 `rollout.go` 行為一致（fixture 逐位元組對拍驗證）
 - `src/http.rs` — 手寫 HTTP/1.1 client（顧問端點是 localhost 純 HTTP；deadline 語義、Content-Length/chunked/close-delimited、1MB body 上限）。rmcp 只提供 MCP transport，對 Ollama 的單發純 HTTP 呼叫不值得再拉 reqwest
-- `src/util.rs` — 共用工具：char-boundary 安全的 truncate、home 目錄
+- `src/logger.rs` — 行為軌跡日誌（advisor.log）：等級過濾、2MB 輪替保留一代、O_APPEND 單行寫入的多 process 並發安全、寫檔失敗靜默
+- `src/util.rs` — 共用工具：char-boundary 安全的 truncate、跨平台資料目錄（dirs）、RFC3339 UTC、私有權限開檔
 - `examples/parity.rs` — 對拍工具：輸出 rollout 反查結果，供與 Go 版逐位元組 diff
 
-執行期產物（皆已 gitignore）：`target/`、`state/`、`hooks-debug.log`。
+執行期產物（皆已 gitignore，落點見「記錄與追查」）：`target/`、`state/`、`advisor.log*`、`hooks-debug.log`。
+
+## 記錄與追查
+
+執行期產物集中在單一資料目錄（`util::data_dir()`，跨平台由 [dirs](https://crates.io/crates/dirs) 解析）：
+
+| OS | 位置 |
+|---|---|
+| Linux | `~/.local/share/zcode-advisor/`（尊重 `$XDG_DATA_HOME`） |
+| macOS | `~/Library/Application Support/zcode-advisor/` |
+| Windows | `%LOCALAPPDATA%\zcode-advisor\` |
+
+- **`advisor.log`（＋輪替 `.1`）**——行為軌跡：「我們做了什麼、為什麼」。格式 `<RFC3339 UTC> pid=<pid> mode=<server|hook> <LEVEL> <key=value>`，每行一事件：consult 生命週期（question 摘要 → rollout match → `done t=4.2s ctx=48231B advice=1706B`／`failed err=…`）、hook 每個決策點（`decision=remind open=2/3`、`decision=silent reason=consulted|budget|cooldown|short-prompt`…）。追查「顧問為什麼這樣回答」對 `question=`/`sess=` grep；「hook 為什麼沒觸發」看 `decision=silent reason=`。超過 2MB 保留一代後重開（多 process 同時跨過門檻的極窄窗口下為盡力而為，最壞損失舊世代、不損行完整性）；多 process 並發寫靠 O_APPEND＋單行寫入保持完整；寫檔失敗靜默丟棄——記錄系統絕不讓任務失敗。
+- **`hooks-debug.log`**——原始擷取：「ZCode 餵了什麼」（每次 hook 的完整 stdin，超過 2MB 重開）。確認 ZCode 實際欄位名用。
+- **`state/<sess>.state.json`**——hook 節流計數（提醒/失敗/卡關/已諮詢）。
+
+**等級**：`ADVISOR_LOG` 環境變數（`debug|info|error`，預設 `info`）——本專案唯一的環境變數，純開發用途。`debug` 額外記錄完整 question、送出的 context 位元組數、advice 開頭 200 字（重現顧問看到什麼）。檔案為 0600（unix）且在使用者自家目錄；內容含對話片段，與 hooks-debug.log 同一隱私邊界。
 
 ## 與 Go 版的差異
 
-Hook 層與 rollout 反查逐位元組一致、state 檔互通（已實測）。MCP 層改用 rmcp 後的差異：
+Hook 輸出（提醒文字、additionalContext 格式）與 rollout 反查逐位元組一致（已實測）；MCP 層改用 rmcp、執行期資料移至跨平台資料目錄後的差異：
 
+- **資料目錄**：state／日誌改落各 OS 慣例位置（見「記錄與追查」），不讀也不寫 Go 遺留的 `~/.zcode/zcode-advisor/`——不做移轉，重置後最多多一次開場提醒。
 - **wire 回應形狀**：rmcp 序列化的 key 順序/細節與手寫版不同（spec 合規，client 無感）；`inputSchema` 附帶 `$schema` 欄位、`context` 型別標為 `["string","null"]`（schemars 對 `Option` 的如實描述）。
 - **缺參數的錯誤**：缺 `question` 由 rmcp 前置解碼攔下，回 `failed to deserialize parameters: missing field \`question\``（isError 結果，caller 可見）；空白的 `question` 仍回舊版原文。未知方法／參數非物件的錯誤文字也是 rmcp 形狀（`-32601` 只夾帶方法/工具名）；**非 JSON 行靜默丟棄**（Go 回 `-32700` parse error）。
 - **版本協商**：支援集合內 echo；不認得的版本回 rmcp 最新（Go 是盲目 echo）。

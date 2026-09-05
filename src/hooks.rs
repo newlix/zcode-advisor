@@ -1,31 +1,32 @@
 // hook 模式：zcode-advisor hook <Event>，由 ZCode 的 hooks 機制以 stdin 餵入事件 JSON。
 // 只在規則抓得住的關鍵時刻諮詢顧問——任務開場（有份量的 prompt）與連續工具失敗（卡關），
 // 其餘事件一律靜默放行；顧問失敗也靜默放行，絕不擋工作。
-// 本檔對應 Go 版的 hooks.go；state 檔路徑與欄位和 Go 版完全互通（可無縫換裝）。
+// 每個決策點都寫一行軌跡到 advisor.log（decision=… reason=…），供事後追查。
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::server::{ask_advisor, ADVISOR_MODEL};
-use crate::util::{home_dir, now_secs, truncate};
+use crate::util::{create_private_dir, data_dir, now_secs, open_private_append, open_private_write, truncate};
+use crate::logger;
 
-const REMINDER_BUDGET: u32 = 3; // 每個 session 最多提醒幾次
+const REMINDER_BUDGET: i64 = 3; // 每個 session 最多提醒幾次
 const OPEN_PROMPT_MIN_RUNES: usize = 40; // prompt 低於此長度視為瑣碎請求，不打擾
-const STUCK_FAIL_THRESHOLD: u32 = 2; // 連續失敗幾次視為卡關
+const STUCK_FAIL_THRESHOLD: i64 = 2; // 連續失敗幾次視為卡關
 const STUCK_COOLDOWN_SECS: i64 = 5 * 60; // 兩次卡關診斷的最小間隔
-const STUCK_BUDGET: u32 = 5; // 每個 session 最多幾次卡關診斷
+const STUCK_BUDGET: i64 = 5; // 每個 session 最多幾次卡關診斷
 const STATE_STALE_AFTER_SECS: i64 = 30 * 60; // 拿不到 session id 時的計數有效期
 
 pub fn run_hook(event: &str) {
+    logger::init("hook");
     // 上限 4MB，對應 Go 版 io.LimitReader(os.Stdin, 4<<20)
     let mut stdin = Vec::new();
     let _ = std::io::stdin().take(4 << 20).read_to_end(&mut stdin);
-    debug_log(event, &stdin); // 首次上線後可由此檢視 ZCode 實際餵入的欄位
+    debug_log(event, &stdin); // 「ZCode 餵了什麼」的原始擷取；行為軌跡見 advisor.log
 
     let m: Value = serde_json::from_slice(&stdin).unwrap_or(Value::Null); // 解不動 → 全部查無值
 
@@ -38,8 +39,12 @@ pub fn run_hook(event: &str) {
             let mut st = load_state(&sess);
             st.fail = 0;
             save_state(&sess, &st);
+            logger::info(&format!("hook event=PostToolUseOK sess={sess} decision=fail-reset"));
         }
-        _ => eprintln!("advisor-hook: unknown hook event: {event}"),
+        _ => {
+            eprintln!("advisor-hook: unknown hook event: {event}");
+            logger::info(&format!("hook event={event} decision=silent reason=unknown-event"));
+        }
     }
 }
 
@@ -47,17 +52,31 @@ pub fn run_hook(event: &str) {
 // 尚未用過 consult_advisor 時注入一行提醒，不打 API、不等顧問；要不要問、何時問由主模型自己決定。
 fn hook_user_prompt_submit(m: &Value) {
     let prompt = m.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let sess = session_key(m);
     // Go 的 utf8.RuneCountInString ≡ chars().count()（不是 bytes 的 len()）
     if prompt.trim().chars().count() < OPEN_PROMPT_MIN_RUNES {
+        logger::info(&format!(
+            "hook event=UserPromptSubmit sess={sess} decision=silent reason=short-prompt(len<{})",
+            OPEN_PROMPT_MIN_RUNES
+        ));
         return;
     }
-    let sess = session_key(m);
     let mut st = load_state(&sess);
-    if st.consulted || st.open >= REMINDER_BUDGET as i64 {
+    if st.consulted || st.open >= REMINDER_BUDGET {
+        logger::info(&format!(
+            "hook event=UserPromptSubmit sess={sess} decision=silent reason={} open={}/{}",
+            if st.consulted { "consulted" } else { "budget" },
+            st.open,
+            REMINDER_BUDGET
+        ));
         return;
     }
     st.open = st.open.saturating_add(1);
     save_state(&sess, &st);
+    logger::info(&format!(
+        "hook event=UserPromptSubmit sess={sess} decision=remind open={}/{}",
+        st.open, REMINDER_BUDGET
+    ));
     // 文字仿原版 nudge：事實開頭＋條件式判準（不明的設計取捨／未排除的失敗模式）＋
     // timing 教育（定位不算實質工作、定下做法前要問）。我們在 turn 0 注入，
     // 靠文字教模型「先定位再問」，補原版 turn-2 nudge 的時點優勢。
@@ -75,36 +94,62 @@ fn hook_post_tool_use_failure(m: &Value) {
     let sess = session_key(m);
     let mut st = load_state(&sess);
     st.fail = st.fail.saturating_add(1);
-    if st.fail < STUCK_FAIL_THRESHOLD as i64 {
+    if st.fail < STUCK_FAIL_THRESHOLD {
         save_state(&sess, &st);
+        logger::info(&format!(
+            "hook event=PostToolUseFailure sess={sess} decision=silent reason=below-threshold fail={}/{}",
+            st.fail, STUCK_FAIL_THRESHOLD
+        ));
         return;
     }
-    if st.stuck >= STUCK_BUDGET as i64 {
+    if st.stuck >= STUCK_BUDGET {
         save_state(&sess, &st);
+        logger::info(&format!(
+            "hook event=PostToolUseFailure sess={sess} decision=silent reason=budget stuck={}/{}",
+            st.stuck, STUCK_BUDGET
+        ));
         return;
     }
     if now_secs().saturating_sub(st.stuck_at) < STUCK_COOLDOWN_SECS {
         save_state(&sess, &st);
+        logger::info(&format!(
+            "hook event=PostToolUseFailure sess={sess} decision=silent reason=cooldown fail={}/{}",
+            st.fail, STUCK_FAIL_THRESHOLD
+        ));
         return;
     }
     st.fail = 0;
     st.stuck = st.stuck.saturating_add(1);
     st.stuck_at = now_secs();
     save_state(&sess, &st);
+    logger::info(&format!(
+        "hook event=PostToolUseFailure sess={sess} fail={}/{} decision=stuck-consult stuck={}/{}",
+        STUCK_FAIL_THRESHOLD, STUCK_FAIL_THRESHOLD, st.stuck, STUCK_BUDGET
+    ));
 
-    // 重新序列化成規範 JSON（鍵排序），與 Go 版 json.Marshal(map) 對齊
+    // 重新序列化成規範 JSON（鍵排序）
     let payload = serde_json::to_string(m).unwrap_or_else(|_| "null".into());
     let q = "A coding agent's tool calls keep failing; it appears stuck. Latest failed tool event (JSON):\n".to_string()
         + &truncate(&payload, 2000)
         + "\n\nDiagnose likely causes and advise: what to check, what to try next, and when to stop and report to the user. Under 150 words, plain text.";
-    let advice = match ask_advisor(&q, "") {
-        Ok(a) => a,
+    let started = std::time::Instant::now();
+    match ask_advisor(&q, "") {
+        Ok(advice) => {
+            logger::info(&format!(
+                "hook event=PostToolUseFailure sess={sess} stuck advice t={:?} len={}B",
+                started.elapsed(),
+                advice.len()
+            ));
+            emit_context("PostToolUseFailure", &format!("【advisor 卡關建議 · {ADVISOR_MODEL}】\n{advice}"));
+        }
         Err(e) => {
             eprintln!("advisor-hook: stuck advice skipped: {e}");
-            return;
+            logger::info(&format!(
+                "hook event=PostToolUseFailure sess={sess} stuck advice skipped t={:?} err={e}",
+                started.elapsed()
+            ));
         }
-    };
-    emit_context("PostToolUseFailure", &format!("【advisor 卡關建議 · {ADVISOR_MODEL}】\n{advice}"));
+    }
 }
 
 // emitContext 輸出 ZCode hook 的 additionalContext 格式；事件名錯了會被嚴格 schema 拒掉（無害）。
@@ -119,8 +164,8 @@ fn emit_context(event: &str, text: &str) {
 }
 
 // ---- session 狀態（計數用，壞了也只影響節流）----
-// 欄位名與 Go 版 hookState 的 json tags 完全一致，兩版 binary 可共用同一份 state/
-// 計數用 i64（Go 的 int/int64）＋飽和運算：被改壞的狀態檔最多讓計數失效，不該 panic。
+// 欄位名沿用 Go 版 hookState 的 json tags；計數用 i64＋飽和運算：
+// 被改壞的狀態檔最多讓計數失效，不該 panic。
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct HookState {
@@ -137,7 +182,7 @@ fn state_path(sess: &str) -> PathBuf {
 }
 
 pub fn state_dir() -> PathBuf {
-    home_dir().join(".zcode").join("zcode-advisor").join("state")
+    data_dir().join("state")
 }
 
 fn load_state(sess: &str) -> HookState {
@@ -145,6 +190,7 @@ fn load_state(sess: &str) -> HookState {
     // 新鮮度重置只適用於拿不到 session id 的 "default" 案例；
     // 真實 session id 每次都是新的，計數不該跨 session 被誤清。
     if sess == "default" && now_secs().saturating_sub(st.ts) > STATE_STALE_AFTER_SECS {
+        logger::info("state stale reset sess=default");
         return HookState::default();
     }
     st
@@ -153,10 +199,18 @@ fn load_state(sess: &str) -> HookState {
 fn load_state_at(path: &Path) -> HookState {
     // 對應 Go「json.Unmarshal 錯誤被忽略、保留已解到的欄位」的部分保鮮語義：
     // 走 Value 逐欄盡力萃取，缺欄/null/型別不合回零值。
-    let v: Value = fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(Value::Null);
+    // 檔案存在但整體不是 JSON → 全零＋留痕（這會讓提醒重新發聲，值得可追查）
+    let raw = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return HookState::default(),
+    };
+    let v: Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            logger::info(&format!("state unreadable zeroed path={}", path.display()));
+            return HookState::default();
+        }
+    };
     HookState {
         ts: v.get("ts").and_then(Value::as_i64).unwrap_or(0),
         open: v.get("open").and_then(Value::as_i64).unwrap_or(0),
@@ -175,17 +229,14 @@ fn save_state(sess: &str, st: &HookState) {
 
 fn save_state_at(path: &Path, st: &HookState) {
     if let Some(dir) = path.parent() {
-        let _ = fs::DirBuilder::new().mode(0o700).recursive(true).create(dir);
+        let _ = create_private_dir(dir);
     }
     if let Ok(b) = serde_json::to_vec(st) {
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-        {
+        if let Ok(mut f) = open_private_write(path) {
             let _ = f.write_all(&b);
+        } else {
+            // 寫不進去 → 提醒不會收聲（下次再提醒）；留痕供追查
+            logger::debug(&format!("state write failed path={}", path.display()));
         }
     }
 }
@@ -219,7 +270,7 @@ pub fn mark_consulted(session_id: &str) {
 }
 
 // sanitizeSession：保留 [A-Za-z0-9._-]，其餘換 '_'，上限 64 位元組
-// （合法字元與替換字皆 1 byte，位元組數＝字元數，與 Go 版一致）。
+// （合法字元與替換字皆 1 byte，位元組數＝字元數）。
 fn sanitize_session(s: &str) -> String {
     let mut b = String::new();
     for r in s.chars() {
@@ -234,47 +285,21 @@ fn sanitize_session(s: &str) -> String {
     b
 }
 
-// debugLog：把每次 hook 的原始輸入留檔，供第一次上線時確認實際欄位名；超過 2MB 就重開。
-// 時間戳為 UTC RFC3339（Go 版用本地時區；此檔僅供人工檢視，不影響行為）。
+// debugLog：把每次 hook 的原始輸入留檔（「ZCode 餵了什麼」），供確認實際欄位名；
+// 超過 2MB 就輪替。行為軌跡在 advisor.log（logger 模組），兩者職責不同。
 fn debug_log(event: &str, stdin: &[u8]) {
-    let path = home_dir().join(".zcode").join("zcode-advisor").join("hooks-debug.log");
+    let path = data_dir().join("hooks-debug.log");
     if let Ok(md) = fs::metadata(&path) {
         if md.len() > 2 << 20 {
             let _ = fs::remove_file(&path);
         }
     }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path) {
-        let _ = writeln!(f, "=== {} {} ===\n{}", event, rfc3339_utc(now_secs()), String::from_utf8_lossy(stdin));
+    if let Some(dir) = path.parent() {
+        let _ = create_private_dir(dir);
     }
-}
-
-// rfc3339_utc：不引入 chrono 的最小實作（Howard Hinnant 的 civil_from_days 演算法）。
-fn rfc3339_utc(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
-
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    if let Ok(mut f) = open_private_append(&path) {
+        let _ = writeln!(f, "=== {} {} ===\n{}", event, crate::util::rfc3339_utc(now_secs()), String::from_utf8_lossy(stdin));
+    }
 }
 
 #[cfg(test)]
@@ -288,12 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn state_roundtrip_and_field_names_match_go() {
+    fn state_roundtrip_and_field_names() {
         let path = temp_path("rt").join("s1.state.json");
         let st = HookState { ts: 1725500000, open: 2, fail: 1, stuck: 3, stuck_at: 1725490000, consulted: true };
         save_state_at(&path, &st);
         let raw = fs::read_to_string(&path).unwrap();
-        // Go 版 json tags 的欄位名（兩版 state 檔互通的關鍵）
+        // 沿用 Go 版 json tags 的欄位名
         for key in [r#""ts":1725500000"#, r#""open":2"#, r#""fail":1"#, r#""stuck":3"#, r#""stuck_at":1725490000"#, r#""consulted":true"#] {
             assert!(raw.contains(key), "missing {key} in {raw}");
         }
@@ -322,13 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_known_values() {
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_725_500_000), "2024-09-05T01:33:20Z"); // 與 date -u 對拍
-        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z"); // 閏年
-    }
-
-    #[test]
     fn failure_threshold_and_cooldown_state_machine() {
         // 直接驗證 hookPostToolUseFailure 的計數邏輯（不打 API 的前置路徑）
         let sess = sanitize_session("smoke-sm-1");
@@ -337,9 +355,9 @@ mod tests {
 
         let mut st = load_state(&sess);
         st.fail += 1;
-        assert!(st.fail < STUCK_FAIL_THRESHOLD as i64); // 第一次失敗：未達門檻
+        assert!(st.fail < STUCK_FAIL_THRESHOLD); // 第一次失敗：未達門檻
         st.fail += 1;
-        assert!(st.fail >= STUCK_FAIL_THRESHOLD as i64); // 第二次：達門檻
+        assert!(st.fail >= STUCK_FAIL_THRESHOLD); // 第二次：達門檻
         st.fail = 0;
         st.stuck += 1;
         st.stuck_at = now_secs();

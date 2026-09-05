@@ -20,7 +20,7 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 
-use crate::{hooks, http, rollout};
+use crate::{hooks, http, logger, rollout};
 
 pub const SERVER_NAME: &str = env!("CARGO_PKG_NAME"); // 單一事實來源：Cargo.toml
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,6 +88,7 @@ impl Advisor {
         Parameters(ConsultArgs { question, context }): Parameters<ConsultArgs>,
     ) -> Result<CallToolResult, McpError> {
         if question.trim().is_empty() {
+            logger::info("consult rejected reason=empty-question");
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "error: 'question' is required and must be non-empty",
             )]));
@@ -97,7 +98,10 @@ impl Advisor {
         // rollout 反查（掃檔）與 HTTP（90s deadline）都是阻塞 IO：丟 blocking pool，
         // 不占 runtime 線程；panic 由 JoinError 接住，降級為 caller 可見的錯誤結果
         let res = tokio::task::spawn_blocking(move || consult(&question, &context)).await;
-        Ok(res.unwrap_or_else(|e| advice_error(&format!("error: consult task failed: {e}"))))
+        Ok(res.unwrap_or_else(|e| {
+            logger::info(&format!("consult failed reason=task-panic err={e}"));
+            advice_error(&format!("error: consult task failed: {e}"))
+        }))
     }
 }
 
@@ -111,11 +115,16 @@ impl ServerHandler for Advisor {
 }
 
 pub fn run_server() {
+    logger::init("server");
     eprintln!("advisor: model={ADVISOR_MODEL} url={ADVISOR_URL}"); // 日誌一律走 stderr，stdout 只有 MCP 協議
+    logger::info(&format!(
+        "server started version={SERVER_VERSION} model={ADVISOR_MODEL} url={ADVISOR_URL}"
+    ));
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("advisor: runtime init failed: {e}");
+            logger::error(&format!("runtime init failed err={e}"));
             return;
         }
     };
@@ -132,9 +141,11 @@ pub fn run_server() {
     rt.shutdown_timeout(Duration::from_secs(5));
     if CONSULT_IN_FLIGHT.load(Ordering::SeqCst) {
         eprintln!("advisor: shutdown cut an in-flight consult (client gone; state writes happen before HTTP, nothing half-written)");
+        logger::info("shutdown cut an in-flight consult (client gone; state writes happen before HTTP, nothing half-written)");
     }
     if let Err(e) = result {
         eprintln!("advisor: server error: {e}");
+        logger::error(&format!("server error err={e:?}"));
     }
 }
 
@@ -144,7 +155,10 @@ pub fn run_server() {
 fn consult(question: &str, context_str: &str) -> CallToolResult {
     let _in_flight = InFlightGuard;
     CONSULT_IN_FLIGHT.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    logger::info(&format!("consult question={:?}", crate::util::truncate(question, 48)));
     if MAX_USES > 0 && USE_COUNT.fetch_add(1, Ordering::SeqCst) + 1 > MAX_USES {
+        logger::info("consult rejected reason=budget-exhausted");
         return advice_error(&format!(
             "error: advice budget exhausted (max {MAX_USES} consults for this session); proceed on your own"
         ));
@@ -152,8 +166,11 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
     // 反查呼叫端 session（UUID 級）：自動帶入該 session 的對話作為顧問 context
     let mut advice_context = context_str.to_string();
     let mut session_note = String::new();
+    let mut matched_sess = String::from("-");
     if let Some(m) = rollout::find_calling_session(question) {
         eprintln!("advisor: rollout match: session={} file={}", m.session_id, m.path.display());
+        logger::info(&format!("rollout match session={} file={}", m.session_id, m.path.display()));
+        matched_sess.clone_from(&m.session_id);
         hooks::mark_consulted(&m.session_id); // 已諮詢：開場提醒就此收聲
         if !m.dialog.is_empty() || !m.preamble.is_empty() {
             let mut b = String::new();
@@ -183,12 +200,32 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
         };
         session_note = format!(" | session {short}");
     }
+    logger::debug(&format!(
+        "advisor request question={question:?} ctx={}B",
+        advice_context.len()
+    ));
     match ask_advisor(question, &advice_context) {
-        Err(e) => advice_error(&format!("error: {e}")),
-        Ok(advice) => CallToolResult::success(vec![ContentBlock::text(format!(
-            "[advisor · {}{session_note}]\n{advice}",
-            advisor_label()
-        ))]),
+        Err(e) => {
+            logger::info(&format!(
+                "consult failed sess={matched_sess} t={:?} ctx={}B err={e}",
+                started.elapsed(),
+                advice_context.len()
+            ));
+            advice_error(&format!("error: {e}"))
+        }
+        Ok(advice) => {
+            logger::info(&format!(
+                "consult done sess={matched_sess} t={:?} ctx={}B advice={}B",
+                started.elapsed(),
+                advice_context.len(),
+                advice.len()
+            ));
+            logger::debug(&format!("advice head={:?}", crate::util::truncate(&advice, 200)));
+            CallToolResult::success(vec![ContentBlock::text(format!(
+                "[advisor · {}{session_note}]\n{advice}",
+                advisor_label()
+            ))])
+        }
     }
 }
 

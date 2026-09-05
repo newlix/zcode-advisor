@@ -1,4 +1,6 @@
 /target
 state/
+advisor.log*
 hooks-debug.log
 *.bak*
+.zcode/
