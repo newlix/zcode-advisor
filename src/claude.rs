@@ -30,7 +30,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 // Fixed hygiene flag set shared by every invocation (tests drive `run` with
 // other binaries, so this lives in one place).
-pub fn cli_args(model: &str, system_prompt: &str) -> Vec<String> {
+fn base_args(model: &str, system_prompt: &str) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--output-format",
@@ -59,10 +59,48 @@ pub fn cli_args(model: &str, system_prompt: &str) -> Vec<String> {
     args
 }
 
+// cli_args: the advisor call — pure model call, no tools.
+pub fn cli_args(model: &str, system_prompt: &str) -> Vec<String> {
+    base_args(model, system_prompt)
+}
+
+// reviewer_args: the review call — an agentic one-shot. --restricted keeps
+// Bash/PowerShell/REPL removed and confines file access to the workspace;
+// --allowedTools whitelists read-only tools (config-validated against
+// {Read, Grep, Glob}); --add-dir extends the boundary to named directories.
+pub fn reviewer_args(model: &str, system_prompt: &str, tools: &str, add_dirs: &[String]) -> Vec<String> {
+    let mut args = base_args(model, system_prompt);
+    args.push("--allowedTools".to_string());
+    args.push(tools.to_string());
+    for d in add_dirs {
+        args.push("--add-dir".to_string());
+        args.push(d.clone());
+    }
+    args
+}
+
 pub fn ask(bin: &str, model: &str, system_prompt: &str, prompt: &str, timeout: Duration) -> Result<String, String> {
     let resolved = resolve_bin(bin)?;
     crate::logger::info(&format!("claude spawn bin={}", resolved.display()));
     run(&resolved, &cli_args(model, system_prompt), prompt, timeout)
+}
+
+pub fn ask_review(
+    bin: &str,
+    model: &str,
+    system_prompt: &str,
+    tools: &str,
+    add_dirs: &[String],
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let resolved = resolve_bin(bin)?;
+    crate::logger::info(&format!(
+        "claude spawn (review) bin={} tools={tools} add_dirs={}",
+        resolved.display(),
+        add_dirs.join(",")
+    ));
+    run(&resolved, &reviewer_args(model, system_prompt, tools, add_dirs), prompt, timeout)
 }
 
 // run: spawn `bin args...`, feed prompt on stdin, capture stdout/stderr with
@@ -302,6 +340,25 @@ mod tests {
         for flag in ["--restricted", "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config"] {
             assert_eq!(a.iter().filter(|x| *x == flag).count(), 1, "{flag}");
         }
+        // the advisor call must NOT carry tool grants
+        assert!(!a.contains(&"--allowedTools".to_string()));
+        assert!(!a.contains(&"--add-dir".to_string()));
+    }
+
+    #[test]
+    fn reviewer_args_shape() {
+        let a = reviewer_args("opus", "RP", "Read,Grep,Glob", &["/w1".to_string(), "/w2".to_string()]);
+        assert!(a.windows(2).any(|w| w[0] == "--allowedTools" && w[1] == "Read,Grep,Glob"));
+        assert!(a.windows(2).any(|w| w[0] == "--add-dir" && w[1] == "/w1"));
+        assert!(a.windows(2).any(|w| w[0] == "--add-dir" && w[1] == "/w2"));
+        assert!(a.windows(2).any(|w| w[0] == "--system-prompt" && w[1] == "RP"));
+        assert!(a.windows(2).any(|w| w[0] == "--model" && w[1] == "opus"));
+        // defense in depth: --restricted stays on even with tools granted
+        assert!(a.contains(&"--restricted".to_string()));
+        // no add_dirs → no dangling --add-dir
+        let a = reviewer_args("", "RP", "Read", &[]);
+        assert!(!a.contains(&"--add-dir".to_string()));
+        assert!(a.windows(2).any(|w| w[0] == "--allowedTools" && w[1] == "Read"));
     }
 
     #[test]

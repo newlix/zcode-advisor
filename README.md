@@ -11,6 +11,7 @@ One binary, two modes, three trigger points:
 | Trigger | Mechanism | Who decides timing |
 |---|---|---|
 | `consult_advisor` tool (MCP) | Called by the main model; automatically attaches the full conversation view + the current turn's monologue | The main model itself |
+| `review_change` tool (MCP) | Independent second-opinion code review: an agentic read-only pass (Read/Grep/Glob) that verifies claims against the actual code; verdict is advisory | The main model itself |
 | Consult reminder (`UserPromptSubmit` hook) | Injects a one-line reminder when the prompt is substantial and no consult has happened yet; **makes no API call** | Rules |
 | Stuck diagnosis (`PostToolUseFailure` hook) | Consults only after ≥2 consecutive failures; 5-minute cooldown, max 5 consults per session | Rules |
 
@@ -128,6 +129,13 @@ url = "https://api.z.ai/api/paas/v4/chat/completions"
 model = "glm-4.7"
 api_key = "${ZAI_API_KEY}"
 max_tokens = 8192      # bump to 16–32k for thinking models
+
+[reviewer]             # the review_change tool; always claude-CLI-backed (the tool loop)
+                       # regardless of the advisor backend; bin/model inherit [claude]
+model = "opus"         # optional; default = [claude].model
+tools = "Read,Grep,Glob"  # whitelist-validated at load (read-only enforced)
+add_dirs = []          # extra --add-dir entries; the workspace (server cwd) is always readable
+timeout_secs = 300     # agentic reviews are slower; the deadline kill is the only turn bound
 ```
 
 ### Backends
@@ -135,6 +143,10 @@ max_tokens = 8192      # bump to 16–32k for thinking models
 - **ollama** (default) — the local Ollama OpenAI-compatible endpoint over plain HTTP (hand-written client). Needs `ollama login` once and a running `ollama serve`; no API key. `kimi-k3:cloud` is Ollama's cloud-hosted model billed through your Ollama account — `ollama pull` can't fetch it and `/api/tags` doesn't list it.
 - **claude** — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 180s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) are scrubbed from the child.
 - **openai** — any OpenAI-compatible chat-completions endpoint over HTTP(S) via ureq/rustls (bundled webpki roots, no system cert store, no openssl). Sends `Authorization: Bearer <api_key>` and the `max_tokens` wire field (not the newer `max_completion_tokens`) — same scope as the Ollama path.
+
+### The reviewer tool
+
+`review_change` always rides the claude CLI's agentic loop regardless of the advisor backend: the reviewer gets `--allowedTools` read-only tools (hard whitelist `Read, Grep, Glob` at config load), stays `--restricted` (no Bash/Write, file access confined to the workspace + `add_dirs`), and the attached conversation is framed as *the executor's unverified account* — the system prompt instructs it to falsify claims against the code. Reviews are serialized (`try_lock`: a second concurrent review fails fast), don't block consults, and the deadline kill is the only turn bound (no `--max-turns` in the CLI yet). Verdicts are advisory, not gates: a crafted workspace file can steer a review, so treat it as a strong second opinion.
 
 ### `${VAR}` interpolation
 
@@ -162,9 +174,9 @@ Backend/model/endpoint/timeouts all live in the config file now. What still live
 ## Files
 
 - The installed executable lives at `~/.cargo/bin/zcode-advisor` (where cargo install puts it); the source is this repo
-- `src/server.rs` — the rmcp MCP server: the `Advisor` handler, the `consult_advisor` tool (spawn_blocking + serialization), `ask_advisor` (backend dispatch + the shared OpenAI-wire-format path), the advisor system prompt
-- `src/config.rs` — the optional TOML config file: backend selection (ollama / claude / openai), `${VAR}` interpolation, defaults, loud-fallback-on-broken-file policy
-- `src/claude.rs` — the Claude Code CLI backend: `claude -p` subprocess with hygiene flags, PATH resolution with fallbacks, stdin/stdout/stderr pipes with caps, deadline kill
+- `src/server.rs` — the rmcp MCP server: the `Advisor` handler, the `consult_advisor` + `review_change` tools (spawn_blocking + serialization), `ask_advisor` (backend dispatch + the shared OpenAI-wire-format path), the advisor/reviewer system prompts
+- `src/config.rs` — the optional TOML config file: backend selection (ollama / claude / openai), `[reviewer]` knobs, `${VAR}` interpolation, defaults, loud-fallback-on-broken-file policy
+- `src/claude.rs` — the Claude Code CLI backends: `claude -p` subprocess (pure model call for consults, `--allowedTools` read-only agentic pass for reviews), PATH resolution with fallbacks, stdin/stdout/stderr pipes with caps, deadline kill
 - `src/hooks.rs` — the three hook handlers, the session state file (`state/<sess>.state.json`: reminder/failure/stuck/consulted counters), the reminder text
 - `src/rollout.rs` — UUID lookup, conversation compression, current-turn monologue extraction
 - `src/http.rs` — a hand-written HTTP/1.1 client (the Ollama endpoint is plain HTTP on localhost; deadline semantics, Content-Length/chunked/close-delimited bodies, a 1MB body cap). The openai backend talks HTTPS through ureq/rustls instead — a one-shot plain-HTTP call to Ollama doesn't justify a client dependency, and the hand-rolled client keeps the default path dependency-free

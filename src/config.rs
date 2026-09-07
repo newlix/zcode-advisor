@@ -39,6 +39,10 @@ pub const OPENAI_MAX_TOKENS: u64 = 8_192; // safe floor; bump to 16–32k for th
 pub const OLLAMA_TIMEOUT: Duration = Duration::from_secs(90);
 pub const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
 pub const OPENAI_TIMEOUT: Duration = Duration::from_secs(90);
+// The reviewer is always a claude CLI agentic call (the tool loop is
+// claude-CLI-specific), independent of the advisor backend choice.
+pub const REVIEWER_TOOLS: &str = "Read,Grep,Glob"; // whitelist-validated, keep read-only
+pub const REVIEWER_TIMEOUT: Duration = Duration::from_secs(300); // agentic reviews are slower
 
 #[derive(Debug, Clone)]
 pub enum Backend {
@@ -52,10 +56,35 @@ pub enum Backend {
     OpenAi { url: String, model: String, api_key: String, max_tokens: u64 },
 }
 
+/// Reviewer knobs (the `review_change` tool). `bin`/`model` default from the
+/// `[claude]` section so both tools share one CLI installation by default.
+#[derive(Debug, Clone)]
+pub struct Reviewer {
+    pub bin: String,
+    pub model: String, // empty = CLI default
+    pub tools: String, // comma-separated, whitelist-validated at load
+    pub add_dirs: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl Reviewer {
+    /// Redacted one-line identity for logs.
+    pub fn summary(&self) -> String {
+        let model = if self.model.trim().is_empty() { "<cli-default>" } else { &self.model };
+        let dirs = if self.add_dirs.is_empty() {
+            "none".to_string()
+        } else {
+            self.add_dirs.join(",")
+        };
+        format!("model={model} tools={} add_dirs={dirs}", self.tools)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub backend: Backend,
     pub timeout: Duration,
+    pub reviewer: Reviewer,
     /// Set when a config file exists but could not be used: defaults are in
     /// effect and this string explains why (stderr + ERROR log + consult prefix).
     pub warning: Option<String>,
@@ -72,6 +101,7 @@ struct FileConfig {
     ollama: Option<OllamaSection>,
     claude: Option<ClaudeSection>,
     openai: Option<OpenAiSection>,
+    reviewer: Option<ReviewerSection>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -98,6 +128,15 @@ struct OpenAiSection {
     max_tokens: Option<u64>,
 }
 
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct ReviewerSection {
+    model: Option<String>,
+    tools: Option<String>,
+    add_dirs: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+}
+
 pub fn default_config() -> Config {
     Config {
         backend: Backend::Ollama {
@@ -106,6 +145,13 @@ pub fn default_config() -> Config {
             max_tokens: OLLAMA_MAX_TOKENS,
         },
         timeout: OLLAMA_TIMEOUT,
+        reviewer: Reviewer {
+            bin: CLAUDE_BIN.to_string(),
+            model: CLAUDE_MODEL.to_string(),
+            tools: REVIEWER_TOOLS.to_string(),
+            add_dirs: Vec::new(),
+            timeout: REVIEWER_TIMEOUT,
+        },
         warning: None,
     }
 }
@@ -166,13 +212,28 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
     // the line can be `api_key = "sk-..."` and the warning lands in logs, so
     // the raw text must not travel with it
     let f: FileConfig = toml::from_str(raw).map_err(|e| format!("invalid TOML: {}", e.message()))?;
-    let timeout = match f.timeout_secs {
-        None => None,
-        Some(0) => return Err("timeout_secs must be > 0".into()),
-        // a bogus huge value would overflow Instant arithmetic mid-consult
-        // (and panic the hook process); one day is far past any real deadline
-        Some(s) if s > 86_400 => return Err("timeout_secs must be ≤ 86400 (one day)".into()),
-        Some(s) => Some(Duration::from_secs(s)),
+    let timeout = f.timeout_secs.map(parse_timeout).transpose()?;
+    // the reviewer defaults inherit [claude]'s bin/model (one CLI install for
+    // both tools), so read them before the backend match consumes the section
+    let (claude_bin, claude_model) = match &f.claude {
+        Some(s) => (s.bin.clone(), s.model.clone()),
+        None => (None, None),
+    };
+    let rs = f.reviewer.unwrap_or_default();
+    let reviewer = Reviewer {
+        bin: interp_opt(claude_bin, CLAUDE_BIN)?,
+        model: match rs.model {
+            Some(m) => interpolate(&m)?,
+            None => interp_opt(claude_model, CLAUDE_MODEL)?,
+        },
+        tools: validate_reviewer_tools(&interp_opt(rs.tools, REVIEWER_TOOLS)?)?,
+        add_dirs: rs
+            .add_dirs
+            .unwrap_or_default()
+            .iter()
+            .map(|d| interpolate(d))
+            .collect::<Result<Vec<_>, _>>()?,
+        timeout: rs.timeout_secs.map(parse_timeout).transpose()?.unwrap_or(REVIEWER_TIMEOUT),
     };
     let backend_name = f.backend.as_deref().unwrap_or("ollama");
     let mut cfg = match backend_name {
@@ -182,13 +243,13 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
             let model = interp_opt(s.model, OLLAMA_MODEL)?;
             let max_tokens = s.max_tokens.unwrap_or(OLLAMA_MAX_TOKENS);
             validate_max_tokens(max_tokens)?;
-            Config { backend: Backend::Ollama { url, model, max_tokens }, timeout: OLLAMA_TIMEOUT, warning: None }
+            Config { backend: Backend::Ollama { url, model, max_tokens }, timeout: OLLAMA_TIMEOUT, reviewer, warning: None }
         }
         "claude" => {
             let s = f.claude.unwrap_or_default();
             let bin = interp_opt(s.bin, CLAUDE_BIN)?;
             let model = interp_opt(s.model, CLAUDE_MODEL)?;
-            Config { backend: Backend::Claude { bin, model }, timeout: CLAUDE_TIMEOUT, warning: None }
+            Config { backend: Backend::Claude { bin, model }, timeout: CLAUDE_TIMEOUT, reviewer, warning: None }
         }
         "openai" => {
             let s = f.openai.ok_or("backend \"openai\" requires an [openai] section")?;
@@ -197,7 +258,12 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
             let api_key = interp_req(s.api_key, "[openai] api_key")?;
             let max_tokens = s.max_tokens.unwrap_or(OPENAI_MAX_TOKENS);
             validate_max_tokens(max_tokens)?;
-            Config { backend: Backend::OpenAi { url, model, api_key, max_tokens }, timeout: OPENAI_TIMEOUT, warning: None }
+            Config {
+                backend: Backend::OpenAi { url, model, api_key, max_tokens },
+                timeout: OPENAI_TIMEOUT,
+                reviewer,
+                warning: None,
+            }
         }
         other => return Err(format!("unknown backend \"{}\" (expected ollama, claude, or openai)", util::truncate(other, 40))),
     };
@@ -205,6 +271,41 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
         cfg.timeout = t;
     }
     Ok(cfg)
+}
+
+// parse_timeout: shared validation for timeout_secs (global and reviewer).
+fn parse_timeout(s: u64) -> Result<Duration, String> {
+    match s {
+        0 => Err("timeout_secs must be > 0".into()),
+        // a bogus huge value would overflow Instant arithmetic mid-consult
+        // (and panic the hook process); one day is far past any real deadline
+        s if s > 86_400 => Err("timeout_secs must be ≤ 86400 (one day)".into()),
+        s => Ok(Duration::from_secs(s)),
+    }
+}
+
+// validate_reviewer_tools: hard whitelist — the tool description promises a
+// read-only reviewer running under the user's CLI auth, so a typo like
+// "Read,Bash" must fail at config load, not mid-review.
+fn validate_reviewer_tools(raw: &str) -> Result<String, String> {
+    const ALLOWED: [&str; 3] = ["Read", "Grep", "Glob"];
+    let mut out = Vec::new();
+    for t in raw.split(',') {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !ALLOWED.contains(&t) {
+            return Err(format!(
+                "reviewer tools: \"{t}\" is not allowed (whitelist: Read, Grep, Glob — the reviewer must stay read-only)"
+            ));
+        }
+        out.push(t.to_string());
+    }
+    if out.is_empty() {
+        return Err("reviewer tools: empty tool set".into());
+    }
+    Ok(out.join(","))
 }
 
 fn validate_max_tokens(v: u64) -> Result<(), String> {
@@ -334,6 +435,7 @@ mod tests {
         // unique names so parallel tests can't collide
         std::env::set_var("ZCA_TEST_VAR", "hello");
         std::env::set_var("ZCA_TEST_EMPTY", "");
+        std::env::set_var("ZCA_TEST_DIR", "/interp-worked");
         std::env::remove_var("ZCA_TEST_UNSET");
 
         assert_eq!(interpolate("plain").unwrap(), "plain");
@@ -404,6 +506,45 @@ mod tests {
         let c = from_toml_str("backend = \"claude\"").unwrap();
         assert!(matches!(c.backend, Backend::Claude { ref bin, .. } if bin == CLAUDE_BIN));
         assert_eq!(c.timeout, CLAUDE_TIMEOUT);
+    }
+
+    #[test]
+    fn reviewer_defaults_and_inheritance() {
+        // no config: read-only whitelist, 300s, claude CLI defaults
+        let c = from_toml_str("").unwrap();
+        assert_eq!(c.reviewer.tools, REVIEWER_TOOLS);
+        assert_eq!(c.reviewer.timeout, REVIEWER_TIMEOUT);
+        assert_eq!(c.reviewer.bin, CLAUDE_BIN);
+        assert!(c.reviewer.model.is_empty());
+        // [claude] section is inherited even when the advisor backend is ollama
+        let c = from_toml_str("[claude]\nbin = \"/opt/claude\"\nmodel = \"sonnet\"").unwrap();
+        assert_eq!(c.reviewer.bin, "/opt/claude");
+        assert_eq!(c.reviewer.model, "sonnet");
+        // [reviewer] overrides win over inheritance
+        let c = from_toml_str(
+            "backend = \"claude\"\n[claude]\nmodel = \"sonnet\"\n[reviewer]\nmodel = \"opus\"\ntimeout_secs = 60\nadd_dirs = [\"/tmp/probe\", \"${ZCA_TEST_DIR}\"]",
+        )
+        .unwrap();
+        assert_eq!(c.reviewer.model, "opus");
+        assert_eq!(c.reviewer.timeout, Duration::from_secs(60));
+        assert_eq!(c.reviewer.add_dirs, vec!["/tmp/probe", "/interp-worked"]);
+        assert_eq!(c.reviewer.summary(), "model=opus tools=Read,Grep,Glob add_dirs=/tmp/probe,/interp-worked");
+    }
+
+    #[test]
+    fn reviewer_tools_are_whitelist_validated() {
+        // the tool description promises a read-only reviewer — non-read-only
+        // tools must fail at config load, naming the offender
+        let err = from_toml_str("[reviewer]\ntools = \"Read,Bash\"").unwrap_err();
+        assert!(err.contains("Bash") && err.contains("not allowed"), "{err}");
+        assert!(from_toml_str("[reviewer]\ntools = \"Read, Write\"").is_err());
+        assert!(from_toml_str("[reviewer]\ntools = \"read\"").is_err()); // case-sensitive
+        assert!(from_toml_str("[reviewer]\ntools = \"\"").unwrap_err().contains("empty"));
+        // whitelist accepted in any order/duplication-free form
+        let c = from_toml_str("[reviewer]\ntools = \"Glob, Read\"").unwrap();
+        assert_eq!(c.reviewer.tools, "Glob,Read");
+        assert!(from_toml_str("[reviewer]\ntimeout_secs = 0").is_err());
+        assert!(from_toml_str("[reviewer]\ntimeout_secs = 99999999999").is_err());
     }
 
     #[test]
