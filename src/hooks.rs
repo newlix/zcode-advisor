@@ -23,6 +23,14 @@ const STUCK_FAIL_THRESHOLD: i64 = 2; // consecutive failures before counting as 
 const STUCK_COOLDOWN_SECS: i64 = 5 * 60; // minimum interval between two stuck diagnoses
 const STUCK_BUDGET: i64 = 5; // max stuck diagnoses per session
 const STATE_STALE_AFTER_SECS: i64 = 30 * 60; // how long counters stay valid when no session id is available
+const REVIEW_BUDGET: i64 = 1; // max review reminders per session (Stop fires every turn; 1 keeps it a one-time gate)
+// The MCP server name as registered under mcp.servers in config.json — a rename
+// there must be mirrored here or review marking silently stops working.
+const REVIEW_TOOL: &str = concat!("mcp__zcode-consultant__", "review_change");
+// Edit-class tools whose success means "files changed"; Bash-based edits
+// (sed -i and friends) are a documented blind spot — parsing commands for
+// edits would misfire on read-only pipelines.
+const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 pub fn run_hook(event: &str) {
     logger::init("hook");
@@ -37,18 +45,58 @@ pub fn run_hook(event: &str) {
         "UserPromptSubmit" => hook_user_prompt_submit(&m),
         "PostToolUseFailure" => hook_post_tool_use_failure(&m),
         "PostToolUseOK" => {
-            // tool succeeded: reset the consecutive-failure counter (zero cost, no API call)
+            // tool succeeded: reset the consecutive-failure counter and note
+            // edit-class / review tool calls (zero cost, no API call)
             let sess = session_key(&m);
             let mut st = load_state(&sess);
             st.fail = 0;
+            note_tool_ok(&mut st, tool_name(&m));
             save_state(&sess, &st);
-            logger::info(&format!("hook event=PostToolUseOK sess={sess} decision=fail-reset"));
+            logger::info(&format!(
+                "hook event=PostToolUseOK sess={sess} decision=fail-reset edits={} reviewed={}",
+                st.edits, st.reviewed
+            ));
         }
+        "Stop" => hook_stop(&m),
         _ => {
             eprintln!("zcode-consultant-hook: unknown hook event: {event}");
             logger::info(&format!("hook event={event} decision=silent reason=unknown-event"));
         }
     }
+}
+
+// tool_name: PostToolUse payloads carry the tool name (verified in
+// hooks-debug.log); missing/undecodable → "" which matches neither list.
+fn tool_name(m: &Value) -> &str {
+    m.get("tool_name").and_then(Value::as_str).unwrap_or("")
+}
+
+// note_tool_ok: a successful review_change call marks the session reviewed
+// (silences the Stop reminder — the agent knows the tool and got feedback);
+// a successful edit-class call counts the session as having changed files.
+fn note_tool_ok(st: &mut HookState, tool: &str) {
+    if is_review_tool(tool) {
+        st.reviewed = true;
+    } else if is_edit_tool(tool) {
+        st.edits = st.edits.saturating_add(1);
+    }
+}
+
+// note_review_tool: the failure-path twin of note_tool_ok's review branch — a
+// FAILED review_change call still marks reviewed (the agent tried; nagging it
+// to review during an outage breaks the never-block invariant).
+fn note_review_tool(st: &mut HookState, tool: &str) {
+    if is_review_tool(tool) {
+        st.reviewed = true;
+    }
+}
+
+fn is_review_tool(tool: &str) -> bool {
+    tool == REVIEW_TOOL
+}
+
+fn is_edit_tool(tool: &str) -> bool {
+    EDIT_TOOLS.contains(&tool)
 }
 
 // hookUserPromptSubmit: the task-opening reminder — counterpart of the original
@@ -100,8 +148,9 @@ fn hook_user_prompt_submit(m: &Value) {
 // hookPostToolUseFailure: consecutive tool failures = a stuck signal.
 // Consults only once the threshold is met, with a cooldown and a budget.
 fn hook_post_tool_use_failure(m: &Value) {
-    let sess = session_key(m);
+    let sess = session_key(&m);
     let mut st = load_state(&sess);
+    note_review_tool(&mut st, tool_name(&m));
     st.fail = st.fail.saturating_add(1);
     if st.fail < STUCK_FAIL_THRESHOLD {
         save_state(&sess, &st);
@@ -161,6 +210,53 @@ fn hook_post_tool_use_failure(m: &Value) {
     }
 }
 
+// hookStop: the review gate — counterpart of the opening reminder. When the
+// session edited files but review_change never ran, inject one reminder as the
+// agent is about to declare the task done. No API call, never forces
+// continuation (continue:true exists in the schema but would block real work).
+fn hook_stop(m: &Value) {
+    let sess = session_key(&m);
+    // When a Stop hook itself wakes the agent, ZCode re-fires Stop with
+    // stop_hook_active=true — never re-remind from that wakeup.
+    if m.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false) {
+        logger::info(&format!("hook event=Stop sess={sess} decision=silent reason=stop-hook-active"));
+        return;
+    }
+    let mut st = load_state(&sess);
+    if !should_remind_review(&st) {
+        let reason = if st.reviewed {
+            "reviewed"
+        } else if st.edits == 0 {
+            "no-edits"
+        } else {
+            "budget"
+        };
+        logger::info(&format!(
+            "hook event=Stop sess={sess} decision=silent reason={reason} edits={} reviewed={} reminded={}/{}",
+            st.edits, st.reviewed, st.review_reminded, REVIEW_BUDGET
+        ));
+        return;
+    }
+    st.review_reminded = st.review_reminded.saturating_add(1);
+    save_state(&sess, &st);
+    logger::info(&format!(
+        "hook event=Stop sess={sess} decision=remind edits={} reminded={}/{}",
+        st.edits, st.review_reminded, REVIEW_BUDGET
+    ));
+    emit_context(
+        "Stop",
+        "[review reminder] This session edited files but review_change was never called. If the changes are risky, \
+         subtle, or hard to reverse, request the review_change tool before declaring done; if they are trivial \
+         (docs, formatting, one-liners), ignore this reminder.",
+    );
+}
+
+// should_remind_review: files were changed, no review call (success OR failure)
+// happened, and the one-shot budget isn't spent.
+fn should_remind_review(st: &HookState) -> bool {
+    st.edits > 0 && !st.reviewed && st.review_reminded < REVIEW_BUDGET
+}
+
 // emitContext outputs ZCode's additionalContext hook format; a wrong event name
 // gets rejected by the strict schema (harmless). Write failures (e.g. a closed
 // pipe) are swallowed silently — never panic or block work over output problems.
@@ -186,6 +282,9 @@ pub struct HookState {
     pub stuck: i64,      // stuck diagnoses used so far
     pub stuck_at: i64,   // time of the last stuck diagnosis (unix seconds)
     pub consulted: bool, // whether consult_advisor has been used in this session (silences the reminder)
+    pub edits: i64,          // successful edit-class tool calls (review gate input)
+    pub reviewed: bool,      // whether review_change was called, success or failure (silences the Stop reminder)
+    pub review_reminded: i64, // review reminders emitted so far
 }
 
 fn state_path(sess: &str) -> PathBuf {
@@ -232,6 +331,9 @@ fn load_state_at(path: &Path) -> HookState {
         stuck: v.get("stuck").and_then(Value::as_i64).unwrap_or(0),
         stuck_at: v.get("stuck_at").and_then(Value::as_i64).unwrap_or(0),
         consulted: v.get("consulted").and_then(Value::as_bool).unwrap_or(false),
+        edits: v.get("edits").and_then(Value::as_i64).unwrap_or(0),
+        reviewed: v.get("reviewed").and_then(Value::as_bool).unwrap_or(false),
+        review_reminded: v.get("review_reminded").and_then(Value::as_i64).unwrap_or(0),
     }
 }
 
@@ -256,12 +358,18 @@ fn save_state_at(path: &Path, st: &HookState) {
     }
 }
 
-// sessionKey: env CLAUDE_SESSION_ID first, then stdin's session_id; neither
-// present → "default" (STATE_STALE_AFTER_SECS prevents cross-session buildup).
+// sessionKey: env CLAUDE_SESSION_ID first, then stdin's session_id (the app
+// sends camelCase "sessionId" in PostToolUse payloads per hooks-debug.log, so
+// fall back to that too); neither present → "default" (STATE_STALE_AFTER_SECS
+// prevents cross-session buildup).
 fn session_key(m: &Value) -> String {
     let s = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
     let s = if s.is_empty() {
-        m.get("session_id").and_then(Value::as_str).unwrap_or("").to_string()
+        m.get("session_id")
+            .and_then(Value::as_str)
+            .or_else(|| m.get("sessionId").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string()
     } else {
         s
     };
@@ -333,11 +441,21 @@ mod tests {
     #[test]
     fn state_roundtrip_and_field_names() {
         let path = temp_path("rt").join("s1.state.json");
-        let st = HookState { ts: 1725500000, open: 2, fail: 1, stuck: 3, stuck_at: 1725490000, consulted: true };
+        let st = HookState {
+            ts: 1725500000,
+            open: 2,
+            fail: 1,
+            stuck: 3,
+            stuck_at: 1725490000,
+            consulted: true,
+            edits: 4,
+            reviewed: true,
+            review_reminded: 1,
+        };
         save_state_at(&path, &st);
         let raw = fs::read_to_string(&path).unwrap();
         // field names follow the Go json tags
-        for key in [r#""ts":1725500000"#, r#""open":2"#, r#""fail":1"#, r#""stuck":3"#, r#""stuck_at":1725490000"#, r#""consulted":true"#] {
+        for key in [r#""ts":1725500000"#, r#""open":2"#, r#""fail":1"#, r#""stuck":3"#, r#""stuck_at":1725490000"#, r#""consulted":true"#, r#""edits":4"#, r#""reviewed":true"#, r#""review_reminded":1"#] {
             assert!(raw.contains(key), "missing {key} in {raw}");
         }
         assert_eq!(load_state_at(&path), st);
@@ -348,11 +466,57 @@ mod tests {
         assert_eq!(st.fail, -5);
         assert_eq!(st.ts, 0);
         assert!(!st.consulted);
+        assert_eq!(st.edits, 0);
+        assert!(!st.reviewed);
         // a null field is a no-op (Go semantics), not missing
         fs::write(&path, r#"{"open":2,"fail":null}"#).unwrap();
         assert_eq!(load_state_at(&path).open, 2);
         assert_eq!(load_state_at(&path).fail, 0);
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tool_classification_and_review_gate_transitions() {
+        // edit-class vs review tool vs everything else
+        assert!(is_edit_tool("Edit") && is_edit_tool("Write") && is_edit_tool("MultiEdit"));
+        assert!(!is_edit_tool("Bash") && !is_edit_tool("Read"));
+        assert!(!is_edit_tool(REVIEW_TOOL));
+        assert!(is_review_tool(REVIEW_TOOL));
+
+        // edit → remind exactly once (budget 1), then silent
+        let mut st = HookState::default();
+        note_tool_ok(&mut st, "Edit");
+        note_tool_ok(&mut st, "Write");
+        assert!(should_remind_review(&st));
+        st.review_reminded += 1;
+        assert!(!should_remind_review(&st));
+
+        // edit → review → silent forever (and reminders never restart)
+        let mut st = HookState::default();
+        note_tool_ok(&mut st, "Edit");
+        note_tool_ok(&mut st, REVIEW_TOOL); // successful review call
+        assert!(st.reviewed);
+        assert!(!should_remind_review(&st));
+
+        // review-before-edit → silent (nothing changed, nothing to gate)
+        let mut st = HookState::default();
+        note_tool_ok(&mut st, REVIEW_TOOL);
+        assert!(!should_remind_review(&st));
+        note_tool_ok(&mut st, "Edit");
+        assert!(!should_remind_review(&st));
+
+        // FAILED review call marks reviewed too (nagging during an outage
+        // breaks the never-block invariant) — same mark, different event path
+        let mut st = HookState::default();
+        note_tool_ok(&mut st, "Edit");
+        note_review_tool(&mut st, REVIEW_TOOL);
+        assert!(st.reviewed);
+        assert!(!should_remind_review(&st));
+
+        // stop_hook_active re-entry never reminds (checked before budget spend)
+        let st = HookState { edits: 1, ..Default::default() };
+        assert!(should_remind_review(&st)); // the state would allow it;
+        assert_eq!(st.review_reminded, 0); // the hook's stop_hook_active check fires first
     }
 
     #[test]

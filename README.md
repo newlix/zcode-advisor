@@ -14,8 +14,9 @@ One binary, two modes, three trigger points:
 | `review_change` tool (MCP) | Independent second-opinion code review: an agentic read-only pass (Read/Grep/Glob) that verifies claims against the actual code; verdict is advisory | The main model itself |
 | Consult reminder (`UserPromptSubmit` hook) | Injects a one-line reminder when the prompt is substantial and no consult has happened yet; **makes no API call** | Rules |
 | Stuck diagnosis (`PostToolUseFailure` hook) | Consults only after ≥2 consecutive failures; 5-minute cooldown, max 5 consults per session | Rules |
+| Review gate (`Stop` hook) | One reminder per session when files were edited but `review_change` was never called; **makes no API call**, never forces continuation — trivial changes (docs/formatting/one-liners) may ignore it | Rules |
 
-A fourth hook, `PostToolUse` (`hook PostToolUseOK`), only resets the consecutive-failure counter — zero cost.
+Two more hooks are bookkeeping only, zero cost: `PostToolUse` (`hook PostToolUseOK`) resets the consecutive-failure counter and counts edit-class tool calls / marks `review_change` calls; a failed `review_change` call also marks reviewed (nagging during an outage would break the never-block invariant). Known blind spot: Bash-based edits (`sed -i` and friends) are invisible to the edit counting — parsing commands for edits would misfire on read-only pipelines.
 
 Design invariant: **the advisor's absence must never hold up real work** — on API failure, Ollama being down, or quota exhaustion, the MCP tool returns an `isError` result visible to the caller (rmcp's tool-level error) and hooks pass through silently; no path can block the task.
 
@@ -88,6 +89,11 @@ Register it in `~/.zcode/cli/config.json` (hooks require `hooks.enabled: true`; 
       "PostToolUse": [
         { "hooks": [{ "type": "command",
             "command": "/home/you/.cargo/bin/zcode-consultant hook PostToolUseOK",
+            "timeoutMs": 10000 }] }
+      ],
+      "Stop": [
+        { "hooks": [{ "type": "command",
+            "command": "/home/you/.cargo/bin/zcode-consultant hook Stop",
             "timeoutMs": 10000 }] }
       ]
     }
@@ -169,7 +175,7 @@ A missing file is silently fine (defaults). A present-but-broken file (bad TOML,
 
 ### Remaining knobs in source
 
-Backend/model/endpoint/timeouts all live in the config file now. What still lives in source (edit + rebuild): the consult cap `MAX_USES` and advisor system prompt in `src/server.rs`; the conversation intake cap `ROLLOUT_TAIL` in `src/rollout.rs`; the throttle constants (reminder cap 3 per session, reminders only for prompts ≥40 chars, stuck threshold of 2 consecutive failures, 5-minute cooldown, stuck budget of 5 per session) in `src/hooks.rs`.
+Backend/model/endpoint/timeouts all live in the config file now. What still lives in source (edit + rebuild): the consult cap `MAX_USES` and advisor system prompt in `src/server.rs`; the conversation intake cap `ROLLOUT_TAIL` in `src/rollout.rs`; the throttle constants (reminder cap 3 per session, reminders only for prompts ≥40 chars, stuck threshold of 2 consecutive failures, 5-minute cooldown, stuck budget of 5 per session, review-reminder budget 1 per session) in `src/hooks.rs`.
 
 ## Files
 
@@ -177,7 +183,7 @@ Backend/model/endpoint/timeouts all live in the config file now. What still live
 - `src/server.rs` — the rmcp MCP server: the `Advisor` handler, the `consult_advisor` + `review_change` tools (spawn_blocking + serialization), `ask_advisor` (backend dispatch + the shared OpenAI-wire-format path), the advisor/reviewer system prompts
 - `src/config.rs` — the optional TOML config file: backend selection (ollama / claude / openai), `[reviewer]` knobs, `${VAR}` interpolation, defaults, loud-fallback-on-broken-file policy
 - `src/claude.rs` — the Claude Code CLI backends: `claude -p` subprocess (pure model call for consults, `--allowedTools` read-only agentic pass for reviews), PATH resolution with fallbacks, stdin/stdout/stderr pipes with caps, deadline kill
-- `src/hooks.rs` — the three hook handlers, the session state file (`state/<sess>.state.json`: reminder/failure/stuck/consulted counters), the reminder text
+- `src/hooks.rs` — the hook handlers (opening reminder, stuck diagnosis, review gate, the two bookkeeping events), the session state file (`state/<sess>.state.json`: reminder/failure/stuck/consulted counters + edits/reviewed/review-reminder), the reminder texts
 - `src/rollout.rs` — UUID lookup, conversation compression, current-turn monologue extraction
 - `src/http.rs` — a hand-written HTTP/1.1 client (the Ollama endpoint is plain HTTP on localhost; deadline semantics, Content-Length/chunked/close-delimited bodies, a 1MB body cap). The openai backend talks HTTPS through ureq/rustls instead — a one-shot plain-HTTP call to Ollama doesn't justify a client dependency, and the hand-rolled client keeps the default path dependency-free
 - `src/logger.rs` — the behavior-trace log (consultant.log): severity markers, 2MB rotation keeping one generation, multi-process-safe single-line writes via O_APPEND, silent on write failure
