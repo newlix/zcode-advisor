@@ -18,7 +18,7 @@ One binary, two modes, three trigger points:
 
 Two more hooks are bookkeeping only, zero cost: `PostToolUse` (`hook PostToolUseOK`) resets the consecutive-failure counter and counts edit-class tool calls / marks `review_change` calls; a failed `review_change` call also marks reviewed (nagging during an outage would break the never-block invariant). Known blind spot: Bash-based edits (`sed -i` and friends) are invisible to the edit counting — parsing commands for edits would misfire on read-only pipelines.
 
-Design invariant: **the advisor's absence must never hold up real work** — on API failure, Ollama being down, or quota exhaustion, the MCP tool returns an `isError` result visible to the caller (rmcp's tool-level error) and hooks pass through silently; no path can block the task.
+Design invariant: **the advisor's absence must never hold up real work** — on API failure, Ollama being down, or quota exhaustion, the MCP tool returns an `isError` result visible to the caller (rmcp's tool-level error) and hooks pass through silently; no advisor path can block the task. (The one deliberate block is the review gate's once-per-session Stop reminder — a local state check with no advisor dependency, and the model can end the turn right after it.)
 
 ## MCP layer (rmcp)
 

@@ -221,8 +221,10 @@ fn hook_post_tool_use_failure(m: &Value) {
 fn hook_stop(m: &Value) {
     let sess = session_key(&m);
     // When a Stop hook itself wakes the agent, ZCode re-fires Stop with
-    // stop_hook_active=true — never re-remind from that wakeup.
-    if m.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false) {
+    // stop_hook_active=true — never re-remind from that wakeup. Payloads
+    // carry both spellings (verified in hooks-debug.log); check both so a
+    // future app-side rename can't silently kill the guard.
+    if is_stop_reentry(m) {
         logger::info(&format!("hook event=Stop sess={sess} decision=silent reason=stop-hook-active"));
         return;
     }
@@ -247,16 +249,36 @@ fn hook_stop(m: &Value) {
         "hook event=Stop sess={sess} decision=remind edits={} reminded={}/{}",
         st.edits, st.review_reminded, REVIEW_BUDGET
     ));
-    let out = json!({
+    print_stop_output();
+}
+
+// stop_output: the wake payload. decision:"block" + reason is the only format
+// whose text demonstrably reaches the model (additionalContext and
+// continue:true are both silently dropped on Stop); keep the shape pinned by
+// the unit test.
+fn stop_output() -> Value {
+    json!({
         "decision": "block",
         "reason": "[review reminder] This turn is ending with file edits but review_change was never called. \
          If the changes are risky, subtle, or hard to reverse, request the review_change tool now; if they are \
          trivial (docs, formatting, one-liners) or already reviewed, just finish your reply without further tool \
          calls and the turn will end."
-    });
+    })
+}
+
+fn print_stop_output() {
     let mut stdout = std::io::stdout();
-    let _ = writeln!(stdout, "{out}");
+    let _ = writeln!(stdout, "{}", stop_output());
     let _ = stdout.flush();
+}
+
+// is_stop_reentry: stop_hook_active in either spelling (payloads carry both
+// today; a rename on either side must not silence the guard silently).
+fn is_stop_reentry(m: &Value) -> bool {
+    m.get("stop_hook_active")
+        .or_else(|| m.get("stopHookActive"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 // should_remind_review: files were changed, no review call (success OR failure)
@@ -525,6 +547,25 @@ mod tests {
         let st = HookState { edits: 1, ..Default::default() };
         assert!(should_remind_review(&st)); // the state would allow it;
         assert_eq!(st.review_reminded, 0); // the hook's stop_hook_active check fires first
+    }
+
+    #[test]
+    fn stop_output_shape_and_reentry_keys() {
+        // The output format churned 3 times in one session (additionalContext →
+        // continue:true → decision:block) — pin it so it can't drift silently.
+        let out = stop_output();
+        assert_eq!(out.get("decision").and_then(Value::as_str), Some("block"));
+        let reason = out.get("reason").and_then(Value::as_str).unwrap_or("");
+        assert!(reason.contains("[review reminder]"), "reason: {reason}");
+        assert!(reason.contains("review_change"));
+        // no other top-level keys that could trip the strict schema
+        let keys: Vec<&str> = out.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["decision", "reason"]);
+        // re-entry guard reads both spellings the app has been seen sending
+        assert!(is_stop_reentry(&json!({"stop_hook_active": true})));
+        assert!(is_stop_reentry(&json!({"stopHookActive": true})));
+        assert!(!is_stop_reentry(&json!({"stop_hook_active": false})));
+        assert!(!is_stop_reentry(&json!({})));
     }
 
     #[test]
