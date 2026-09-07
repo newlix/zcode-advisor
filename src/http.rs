@@ -14,7 +14,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-const MAX_BODY_BYTES: usize = 1 << 20; // aligned with the Go version's io.LimitReader(resp.Body, 1<<20)
+pub const MAX_BODY_BYTES: usize = 1 << 20; // aligned with the Go version's io.LimitReader(resp.Body, 1<<20); the ureq path (openai backend) caps identically
 const MAX_CHUNK: usize = 1 << 22; // per-chunk cap (defensive; Ollama is far below this)
 
 #[derive(Debug)]

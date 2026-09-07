@@ -1,6 +1,6 @@
 # zcode-advisor
 
-A ZCode port of Anthropic's [advisor tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool): lets a cheap, fast executor model (glm-5.3-flash) ask a stronger advisor model for strategic advice at key moments (the advisor is pinned to the local Ollama `kimi-k3:cloud`; model and endpoint are hard-coded constants in `src/server.rs`). Single binary, two modes (MCP stdio server / hook).
+A ZCode port of Anthropic's [advisor tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool): lets a cheap, fast executor model (glm-5.3-flash) ask a stronger advisor model for strategic advice at key moments. The advisor backend is picked in an optional TOML config file (see "Configuration"): the local Ollama `kimi-k3:cloud` by default (zero config), the Claude Code CLI, or any OpenAI-compatible HTTPS endpoint with a bearer key. Single binary, two modes (MCP stdio server / hook).
 
 **The MCP protocol layer uses the official [rmcp](https://crates.io/crates/rmcp) SDK** (conventions of the 2026-07-28 spec: `#[tool_router]`/`#[tool_handler]`, a tokio current-thread runtime, stdio transport). Runtime data (state, logs) lives in a cross-platform data directory (see "Logging and troubleshooting").
 
@@ -98,21 +98,76 @@ Restart your ZCode session for this to take effect. The tool is exposed as `mcp_
 
 Consider also adding advisor usage guidelines to your user instructions file (`~/.zcode/AGENTS.md`): "scoping isn't substantive work; consult once before settling on an approach and once before declaring done; treat advice as a strong prior; bring conflicts back to the advisor for adjudication."
 
-## Advisor model
+## Configuration
 
-The single backend is the local Ollama OpenAI-compatible endpoint with model `kimi-k3:cloud` (an Ollama cloud-hosted model billed through your Ollama account — not a local GGUF: `ollama pull` can't fetch it, and `/api/tags` doesn't list it). **No API key needed**, but you must run `ollama login` once and keep `ollama serve` running locally.
+Without a config file everything runs on the defaults (local Ollama) — the two built-in methods need no configuration. To change backend or knobs, create a TOML file at the OS-conventional config location:
 
-**Every knob of advisor behavior lives in the source**: model/endpoint/output cap `MAX_TOKENS` (recommended value for kimi-k3 is 131072; a reasoning model's thinking text counts toward max_tokens, so a budget that is too small burns out during reasoning and the body comes back empty)/consult cap `MAX_USES` in `src/server.rs`; the conversation intake cap `ROLLOUT_TAIL` in `src/rollout.rs`; the throttle constants (reminder cap 3 per session, reminders only for prompts ≥40 chars, stuck threshold of 2 consecutive failures, 5-minute cooldown, stuck budget of 5 per session) in `src/hooks.rs`. To change any of it, edit the constants and rebuild.
+| OS | Location |
+|---|---|
+| Linux | `~/.config/zcode-advisor/config.toml` (honors `$XDG_CONFIG_HOME`) |
+| macOS | `~/Library/Application Support/zcode-advisor/config.toml` |
+| Windows | `%APPDATA%\zcode-advisor\config.toml` |
 
-Nothing is read from config at runtime, and there are no environment-variable knobs — the only environment inputs are the ZCode-injected `CLAUDE_SESSION_ID` (session identity) and the platform's standard directory variables (`HOME`/`USERPROFILE`, `XDG_DATA_HOME`/`LOCALAPPDATA`, which dirs uses to resolve the data directory).
+`ZCODE_ADVISOR_CONFIG=<path>` overrides the location (handy for tests). Full schema (every field optional unless noted; unknown keys are rejected so typos fail loudly):
+
+```toml
+# backend = "ollama"   # "ollama" | "claude" | "openai" (default: ollama)
+# timeout_secs = 90    # per-call deadline; unset → ollama 90 / claude 180 / openai 90
+
+[ollama]               # applies when backend = "ollama"; values shown are the defaults
+url = "http://localhost:11434/v1/chat/completions"
+model = "kimi-k3:cloud"
+max_tokens = 131072
+
+[claude]               # applies when backend = "claude"
+bin = "claude"         # resolved on PATH, then ~/.local/bin, /usr/local/bin
+model = ""             # empty = the CLI's own configured default model
+
+[openai]               # applies when backend = "openai"; url/model/api_key required
+url = "https://api.z.ai/api/paas/v4/chat/completions"
+model = "glm-4.7"
+api_key = "${ZAI_API_KEY}"
+max_tokens = 8192      # bump to 16–32k for thinking models
+```
+
+### Backends
+
+- **ollama** (default) — the local Ollama OpenAI-compatible endpoint over plain HTTP (hand-written client). Needs `ollama login` once and a running `ollama serve`; no API key. `kimi-k3:cloud` is Ollama's cloud-hosted model billed through your Ollama account — `ollama pull` can't fetch it and `/api/tags` doesn't list it.
+- **claude** — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 180s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) are scrubbed from the child.
+- **openai** — any OpenAI-compatible chat-completions endpoint over HTTP(S) via ureq/rustls (bundled webpki roots, no system cert store, no openssl). Sends `Authorization: Bearer <api_key>` and the `max_tokens` wire field (not the newer `max_completion_tokens`) — same scope as the Ollama path.
+
+### `${VAR}` interpolation
+
+Every string value in the file interpolates environment variables — this is how secrets get in without touching disk or logs:
+
+- `${VAR}` → value of `VAR`; unset **or empty** is a config error naming the variable
+- `${VAR:-fallback}` → value of `VAR`, else the literal `fallback` when unset/empty (`${VAR:-}` marks a value optional)
+- `$$` → a literal `$`
+
+Single-pass: a fallback is never re-expanded. The openai backend's log line prints `api_key=<redacted>`; the label shown to the executor names the host, not the full URL.
+
+### Broken config = loud fallback
+
+A missing file is silently fine (defaults). A present-but-broken file (bad TOML, unknown key, unset `${VAR}`, missing required field, unknown backend name) also falls back to defaults — the advisor must never hold up real work — but loudly: one stderr line, an ERROR entry in advisor.log, and a `[config warning] …` prefix on the next consult's result, so a silent ollama fallback while you configured openai can't waste an afternoon.
+
+### Known limitations
+
+- **Windows + npm-installed claude**: the CLI is a `.cmd` shim there, and cmd.exe's argument parsing can drop the empty `--setting-sources ""` value — user settings may then load (a hygiene degradation only; on Linux/macOS the flag is verified). Unix behavior is tested; Windows is not.
+- **openai backend wire format**: sends `max_tokens`; endpoints that only accept the newer `max_completion_tokens` (very recent OpenAI models) are out of scope.
+
+### Remaining knobs in source
+
+Backend/model/endpoint/timeouts all live in the config file now. What still lives in source (edit + rebuild): the consult cap `MAX_USES` and advisor system prompt in `src/server.rs`; the conversation intake cap `ROLLOUT_TAIL` in `src/rollout.rs`; the throttle constants (reminder cap 3 per session, reminders only for prompts ≥40 chars, stuck threshold of 2 consecutive failures, 5-minute cooldown, stuck budget of 5 per session) in `src/hooks.rs`.
 
 ## Files
 
 - The installed executable lives at `~/.cargo/bin/zcode-advisor` (where cargo install puts it); the source is this repo
-- `src/server.rs` — the rmcp MCP server: the `Advisor` handler, the `consult_advisor` tool (spawn_blocking + serialization), `ask_advisor` (calls the local Ollama OpenAI-compatible endpoint), model constants
+- `src/server.rs` — the rmcp MCP server: the `Advisor` handler, the `consult_advisor` tool (spawn_blocking + serialization), `ask_advisor` (backend dispatch + the shared OpenAI-wire-format path), the advisor system prompt
+- `src/config.rs` — the optional TOML config file: backend selection (ollama / claude / openai), `${VAR}` interpolation, defaults, loud-fallback-on-broken-file policy
+- `src/claude.rs` — the Claude Code CLI backend: `claude -p` subprocess with hygiene flags, PATH resolution with fallbacks, stdin/stdout/stderr pipes with caps, deadline kill
 - `src/hooks.rs` — the three hook handlers, the session state file (`state/<sess>.state.json`: reminder/failure/stuck/consulted counters), the reminder text
 - `src/rollout.rs` — UUID lookup, conversation compression, current-turn monologue extraction
-- `src/http.rs` — a hand-written HTTP/1.1 client (the advisor endpoint is plain HTTP on localhost; deadline semantics, Content-Length/chunked/close-delimited bodies, a 1MB body cap). rmcp provides only an MCP transport, and a one-shot plain-HTTP call to Ollama doesn't justify pulling in reqwest
+- `src/http.rs` — a hand-written HTTP/1.1 client (the Ollama endpoint is plain HTTP on localhost; deadline semantics, Content-Length/chunked/close-delimited bodies, a 1MB body cap). The openai backend talks HTTPS through ureq/rustls instead — a one-shot plain-HTTP call to Ollama doesn't justify a client dependency, and the hand-rolled client keeps the default path dependency-free
 - `src/logger.rs` — the behavior-trace log (advisor.log): severity markers, 2MB rotation keeping one generation, multi-process-safe single-line writes via O_APPEND, silent on write failure
 - `src/util.rs` — shared utilities: char-boundary-safe truncation, cross-platform data directory (dirs), RFC3339 UTC, private-permission file creation
 
@@ -150,9 +205,11 @@ cargo test
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; sleep 2 ) \
   | ~/.cargo/bin/zcode-advisor
 
-# End-to-end (really calls the API; a reasoning model's thinking counts toward max_tokens —
-# too small and it burns out during reasoning, leaving the body empty; the error message
-# then names the MAX_TOKENS constant in the source)
+# End-to-end (really calls the API; the default backend is local Ollama —
+# a reasoning model's thinking counts toward max_tokens, too small and it
+# burns out during reasoning, leaving the body empty; the error message then
+# names max_tokens in the config file. Test another backend by pointing
+# ZCODE_ADVISOR_CONFIG at a config file, e.g. one line: backend = "claude")
 ( printf '%s\n%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \

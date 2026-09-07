@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::server::{ask_advisor, ADVISOR_MODEL};
+use crate::server::{advisor_label, ask_advisor};
 use crate::util::{create_private_dir, data_dir, now_secs, open_private_append, open_private_write, truncate};
 use crate::logger;
 
@@ -149,7 +149,7 @@ fn hook_post_tool_use_failure(m: &Value) {
                 started.elapsed(),
                 advice.len()
             ));
-            emit_context("PostToolUseFailure", &format!("[advisor stuck advice · {ADVISOR_MODEL}]\n{advice}"));
+            emit_context("PostToolUseFailure", &format!("[advisor stuck advice · {}]\n{advice}", advisor_label()));
         }
         Err(e) => {
             eprintln!("advisor-hook: stuck advice skipped: {e}");
