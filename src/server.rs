@@ -1,13 +1,13 @@
 // advisor is a minimal MCP stdio server: it offers the consult_advisor tool to
 // ZCode's main model (the executor), letting a stronger advisor model provide
-// strategic advice. The advisor has a single backend: a cloud-hosted model on
-// the local Ollama (billed through the Ollama account, not a local GGUF); the
-// model and endpoint are hard-coded in the constants below — change them here
-// and rebuild.
+// strategic advice. The advisor backend is chosen in the optional TOML config
+// file (see config.rs): local Ollama (default, zero config), the Claude Code
+// CLI, or any OpenAI-compatible HTTPS endpoint with a bearer key. All three
+// funnel through ask_advisor below, shared by the MCP tool and hook mode.
 // Faithful to the spirit of Anthropic's advisor tool: when the advisor fails,
 // degrade and let the task proceed; output is capped; timing is the main
 // model's call. The protocol layer uses the official rmcp SDK; a consult's
-// blocking work (rollout lookup + HTTP) runs via spawn_blocking and is
+// blocking work (rollout lookup + backend call) runs via spawn_blocking and is
 // serialized with Arc<Mutex> — mirroring the old hand-written loop's "one
 // consult at a time" and preventing concurrent state-file writes (rmcp
 // dispatches requests concurrently).
@@ -25,25 +25,14 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 
-use crate::{hooks, http, logger, rollout};
+use crate::{claude, config, hooks, http, logger, rollout};
 
 pub const SERVER_NAME: &str = env!("CARGO_PKG_NAME"); // single source of truth: Cargo.toml
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-// Advisor model settings (single source of truth): kimi-k3:cloud is Ollama's
-// cloud-hosted model; it needs `ollama login` first and a local `ollama serve`
-// running; `ollama pull` can't fetch it and /api/tags doesn't list it. To
-// change the model or endpoint, edit these two lines and rebuild.
-pub const ADVISOR_MODEL: &str = "kimi-k3:cloud";
-pub const ADVISOR_URL: &str = "http://localhost:11434/v1/chat/completions";
-
-// Advisor output cap (kimi-k3 recommended value). A reasoning model's (kimi-k3
-// and the like) thinking text counts toward max_tokens: a budget that's too
-// small (e.g. 2048) burns out during reasoning and the body comes back empty;
-// max_tokens is a cap, not a reservation — simple questions cost the same
-pub const MAX_TOKENS: u64 = 131072;
-pub const MAX_USES: i32 = 0; // per-session call cap for the MCP tool; 0 = unlimited
 
 pub const ADVISOR_SYSTEM_PROMPT: &str = "You are a senior engineering advisor consulted by a coding agent mid-task. Answer with concise, actionable advice: key risks, recommended approach, and how to verify. Under 300 words. Do not restate the question. Plain text only.";
+
+pub const MAX_USES: i32 = 0; // per-session call cap for the MCP tool; 0 = unlimited
 
 static USE_COUNT: AtomicI32 = AtomicI32::new(0); // MAX_USES counter (consults are serialized; atomic is illustrative)
 
@@ -59,8 +48,33 @@ impl Drop for InFlightGuard {
     }
 }
 
+// advisor_label: a short, redacted identity for the response prefix and tool
+// description (never the api_key; openai names the host, not the full URL).
 pub fn advisor_label() -> String {
-    format!("{ADVISOR_MODEL} via Ollama")
+    match &config::global().backend {
+        config::Backend::Ollama { model, .. } => format!("{model} via Ollama"),
+        config::Backend::Claude { model, .. } => {
+            if model.trim().is_empty() {
+                "Claude Code CLI".to_string()
+            } else {
+                format!("{model} via Claude Code")
+            }
+        }
+        config::Backend::OpenAi { url, model, .. } => format!("{model} @ {}", config::host_of(url)),
+    }
+}
+
+// tool_description: the tool's usage guidance with the configured advisor's
+// (redacted) identity. Injected at list_tools/get_tool time — see the
+// ServerHandler impl below.
+pub fn tool_description() -> String {
+    format!(
+        "Consult a stronger advisor model ({}). Use it when starting a complex or unfamiliar task, \
+         before a large/risky change, when stuck after failed attempts, or when unsure about the approach. \
+         Your current conversation is attached automatically — focus the question on what you need decided, \
+         and use the optional context field only for material not yet in the conversation.",
+        advisor_label()
+    )
 }
 
 #[derive(Clone)]
@@ -92,9 +106,10 @@ impl Advisor {
         }
     }
 
-    // description wording kept verbatim from the old version — it decides when
-    // and how ZCode calls this tool
-    #[tool(description = "Consult a stronger advisor model (kimi-k3:cloud via Ollama) for strategic guidance. Use it when starting a complex or unfamiliar task, before a large/risky change, when stuck after failed attempts, or when unsure about the approach. Your current conversation is attached automatically — focus the question on what you need decided, and use the optional context field only for material not yet in the conversation.")]
+    // description: static fallback text in the router (the #[tool] attribute
+    // only accepts literals); the config-aware description is injected by the
+    // list_tools/get_tool overrides below
+    #[tool(description = "Consult a stronger advisor model for strategic guidance. Use it when starting a complex or unfamiliar task, before a large/risky change, when stuck after failed attempts, or when unsure about the approach. Your current conversation is attached automatically — focus the question on what you need decided, and use the optional context field only for material not yet in the conversation.")]
     async fn consult_advisor(
         &self,
         Parameters(ConsultArgs { question, context }): Parameters<ConsultArgs>,
@@ -127,13 +142,52 @@ impl ServerHandler for Advisor {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
     }
+
+    // list_tools/get_tool are hand-written (the #[tool_handler] macro skips
+    // generation when they exist) so the description can reflect the loaded
+    // config; otherwise they replicate the macro's default output verbatim.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context.protocol_version().is_some_and(|version| {
+            version >= rmcp::model::ProtocolVersion::V_2026_07_28
+        });
+        let mut tools = Self::tool_router().list_all();
+        for t in tools.iter_mut() {
+            t.description = Some(tool_description().into());
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        let mut t = Self::tool_router().get(name).cloned()?;
+        t.description = Some(tool_description().into());
+        Some(t)
+    }
 }
 
 pub fn run_server() {
     logger::init("server");
-    eprintln!("advisor: model={ADVISOR_MODEL} url={ADVISOR_URL}"); // logging always goes to stderr; stdout carries only the MCP protocol
+    let cfg = config::global();
+    // logging always goes to stderr; stdout carries only the MCP protocol
+    eprintln!("advisor: backend={} timeout={:?}", cfg.backend.kind_and_summary(), cfg.timeout);
+    if let Some(w) = &cfg.warning {
+        eprintln!("advisor: {w}");
+        logger::error(&format!("config fallback {}", w));
+    }
     logger::info(&format!(
-        "server started version={SERVER_VERSION} model={ADVISOR_MODEL} url={ADVISOR_URL}"
+        "server started version={SERVER_VERSION} backend={} timeout={:?}",
+        cfg.backend.kind_and_summary(),
+        cfg.timeout
     ));
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -175,6 +229,14 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
     CONSULT_IN_FLIGHT.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     logger::info(&format!("consult question={:?}", crate::util::truncate(question, 48)));
+    // a broken config file fell back to defaults — say so where the caller
+    // will actually see it (silent fallback to ollama when the user configured
+    // openai would waste hours)
+    let warning_tag = config::global()
+        .warning
+        .as_deref()
+        .map(|w| format!("[config warning] {w}\n"))
+        .unwrap_or_default();
     if MAX_USES > 0 && USE_COUNT.fetch_add(1, Ordering::SeqCst) + 1 > MAX_USES {
         logger::info("consult rejected reason=budget-exhausted");
         return advice_error(&format!(
@@ -230,7 +292,7 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
                 started.elapsed(),
                 advice_context.len()
             ));
-            advice_error(&format!("error: {e}"))
+            advice_error(&format!("error: {warning_tag}{e}"))
         }
         Ok(advice) => {
             logger::info(&format!(
@@ -240,35 +302,67 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
                 advice.len()
             ));
             CallToolResult::success(vec![ContentBlock::text(format!(
-                "[advisor · {}{session_note}]\n{advice}",
+                "{warning_tag}[advisor · {}{session_note}]\n{advice}",
                 advisor_label()
             ))])
         }
     }
 }
 
-// ask_advisor calls the local Ollama OpenAI-compatible endpoint. Shared by the
-// MCP tool and hook mode; any error returns Err and the caller decides the
-// presentation (MCP returns an is_error result, hooks pass through silently).
+// ask_advisor routes to the configured backend. Shared by the MCP tool and
+// hook mode; any error returns Err and the caller decides the presentation
+// (MCP returns an is_error result, hooks pass through silently).
 pub fn ask_advisor(question: &str, context_str: &str) -> Result<String, String> {
+    let cfg = config::global();
     let mut user_msg = question.to_string();
     if !context_str.trim().is_empty() {
         user_msg.push_str("\n\n--- context ---\n");
         user_msg.push_str(context_str);
     }
+    match &cfg.backend {
+        config::Backend::Ollama { url, model, max_tokens } => {
+            ask_chat_completions(url, model, *max_tokens, None, &user_msg, cfg.timeout)
+        }
+        config::Backend::OpenAi { url, model, api_key, max_tokens } => {
+            ask_chat_completions(url, model, *max_tokens, Some(api_key), &user_msg, cfg.timeout)
+        }
+        config::Backend::Claude { bin, model } => claude::ask(bin, model, ADVISOR_SYSTEM_PROMPT, &user_msg, cfg.timeout),
+    }
+}
+
+// ask_chat_completions: the OpenAI-compatible wire format, shared by the
+// ollama (plain HTTP via the hand-written client) and openai (HTTP(S) via
+// ureq) backends. The response decoding — including the finish_reason=length
+// detection — is identical for both.
+fn ask_chat_completions(
+    url: &str,
+    model: &str,
+    max_tokens: u64,
+    api_key: Option<&str>,
+    user_msg: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let payload = serde_json::json!({
         "messages": [
             {"content": ADVISOR_SYSTEM_PROMPT, "role": "system"},
             {"content": user_msg, "role": "user"},
         ],
-        "model": ADVISOR_MODEL,
-        "max_tokens": MAX_TOKENS,
+        "model": model,
+        "max_tokens": max_tokens,
         "temperature": 0.3,
     });
     let body = serde_json::to_string(&payload).map_err(|e| format!("encode request: {e}"))?;
 
-    let http::HttpResponse { status, body: resp_body } = http::post_json(ADVISOR_URL, &body, Duration::from_secs(90))
-        .map_err(|e| format!("advisor API unreachable: {e}"))?;
+    let (status, resp_body) = match api_key {
+        None => {
+            // local Ollama: plain HTTP on localhost, hand-written client (the
+            // TLS stack is only pulled in for the openai backend)
+            let http::HttpResponse { status, body } = http::post_json(url, &body, timeout)
+                .map_err(|e| format!("advisor API unreachable: {e}"))?;
+            (status, body)
+        }
+        Some(key) => openai_post(url, key, &body, timeout).map_err(|e| format!("advisor API unreachable: {e}"))?,
+    };
 
     // decode the body before looking at the status — an error page (non-JSON)
     // lands in the unreadable-body path; the decoder takes only the first JSON
@@ -303,10 +397,41 @@ pub fn ask_advisor(question: &str, context_str: &str) -> Result<String, String> 
         // a reasoning model's thinking counts toward max_tokens: length + an
         // empty body = the budget burned out during reasoning
         return Err(format!(
-            "advisor spent all max_tokens={MAX_TOKENS} on reasoning before answering (finish_reason=length); raise the MAX_TOKENS constant in source and rebuild"
+            "advisor spent all max_tokens={max_tokens} on reasoning before answering (finish_reason=length); raise max_tokens in the config file"
         ));
     }
     Err("advisor returned an empty response".into())
+}
+
+// openai_post: one HTTPS (or HTTP) POST via ureq/rustls. http_status_as_error
+// is turned off so 4xx/5xx come back as a response whose body we can decode
+// (the provider's error.message) instead of an opaque error variant; the body
+// cap matches the hand-written client's.
+fn openai_post(url: &str, api_key: &str, body: &str, timeout: Duration) -> Result<(u16, Vec<u8>), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = agent
+        .post(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+        .map_err(|e| {
+            // ureq's error text can embed the full request URL (a query string
+            // may carry a token) — name the host instead
+            let host = config::host_of(url);
+            format!("request to {host} failed: {}", e.to_string().replace(url, host))
+        })?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .with_config()
+        .limit(crate::http::MAX_BODY_BYTES as u64)
+        .read_to_string()
+        .map_err(|e| format!("reading response body: {e}"))?;
+    Ok((status, text.into_bytes()))
 }
 
 // Response from Ollama's OpenAI-compatible endpoint. Go's encoding/json treats
@@ -372,9 +497,104 @@ mod tests {
         let tools = router.list_all();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name.to_string(), "consult_advisor");
+        // the router's own description is the static fallback text (the
+        // #[tool] attribute only accepts literals)
         let desc = tools[0].description.as_deref().unwrap_or("");
-        assert!(desc.contains("kimi-k3:cloud via Ollama"), "{desc}");
+        assert!(desc.contains("Consult a stronger advisor model"), "{desc}");
         assert!(desc.contains("Your current conversation is attached automatically"), "{desc}");
+    }
+
+    #[test]
+    fn get_tool_injects_the_config_aware_description() {
+        // list_tools/get_tool are hand-written to replace the router's static
+        // description with the config-aware one (advisor_label)
+        let t = Advisor::new().get_tool("consult_advisor").expect("tool registered");
+        let desc = t.description.as_deref().unwrap_or("");
+        assert!(desc.contains("Consult a stronger advisor model ("), "{desc}");
+        assert!(desc.contains(advisor_label().as_str()), "{desc}");
+        assert!(desc.contains("Your current conversation is attached automatically"), "{desc}");
+        assert!(Advisor::new().get_tool("no_such_tool").is_none());
+    }
+
+    #[test]
+    fn openai_backend_sends_bearer_and_decodes() {
+        // the generic openai backend over local http:// via ureq: asserts the
+        // Authorization header, the wire payload, and shared decoding
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // read the full request: headers, then Content-Length bytes of body
+            let mut raw: Vec<u8> = Vec::new();
+            let header_end = loop {
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+                let mut tmp = [0u8; 4096];
+                let n = s.read(&mut tmp).unwrap();
+                assert!(n > 0, "client hung up before headers finished");
+                raw.extend_from_slice(&tmp[..n]);
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]).to_lowercase();
+            assert!(head.contains("authorization: bearer sk-test-123"), "headers: {head}");
+            let mut body = raw[header_end + 4..].to_vec();
+            let cl: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
+                .unwrap_or(0);
+            while body.len() < cl {
+                let mut tmp = [0u8; 4096];
+                let n = s.read(&mut tmp).unwrap();
+                assert!(n > 0, "client hung up before body finished");
+                body.extend_from_slice(&tmp[..n]);
+            }
+            let body_str = String::from_utf8_lossy(&body).to_string();
+            assert!(body_str.contains("\"model\":\"glm-test\""), "body: {body_str}");
+            assert!(body_str.contains("\"max_tokens\":4096"), "body: {body_str}");
+            let resp = r#"{"choices":[{"message":{"content":"advice!"},"finish_reason":"stop"}]}"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp.len(),
+                resp
+            );
+        });
+        let advice = ask_chat_completions(
+            &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            "glm-test",
+            4096,
+            Some("sk-test-123"),
+            "what now?",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(advice, "advice!");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn advisor_label_reflects_backend_without_secrets() {
+        let label = advisor_label();
+        assert!(!label.is_empty());
+        assert!(!label.to_lowercase().contains("key"), "{label}");
+    }
+
+    #[test]
+    fn openai_transport_error_hides_query_string_token() {
+        // a closed port triggers a transport error; the message must name the
+        // host but never echo a token that rode in the URL's query string
+        let err = ask_chat_completions(
+            "http://127.0.0.1:1/v1/chat/completions?token=super-secret",
+            "m",
+            4096,
+            Some("k"),
+            "q",
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+        assert!(!err.contains("super-secret"), "leaked: {err}");
+        assert!(err.contains("127.0.0.1:1"), "{err}");
     }
 
     #[test]
