@@ -211,9 +211,13 @@ fn hook_post_tool_use_failure(m: &Value) {
 }
 
 // hookStop: the review gate — counterpart of the opening reminder. When the
-// session edited files but review_change never ran, inject one reminder as the
-// agent is about to declare the task done. No API call, never forces
-// continuation (continue:true exists in the schema but would block real work).
+// session edited files but review_change never ran, wake the turn once with a
+// review reminder. ZCode's Stop hook silently drops additionalContext
+// (verified 3.11.x: the hook fires and its output is accepted, but the text
+// never reaches the model or the rollout), so the only channel that actually
+// reaches the model is continue:true + stopReason — the same mechanism the
+// schema exposes as stopShouldContinue. Bounded: budget 1 per session, and
+// stop_hook_active short-circuits the re-fired Stop so the wake can't loop.
 fn hook_stop(m: &Value) {
     let sess = session_key(&m);
     // When a Stop hook itself wakes the agent, ZCode re-fires Stop with
@@ -243,12 +247,16 @@ fn hook_stop(m: &Value) {
         "hook event=Stop sess={sess} decision=remind edits={} reminded={}/{}",
         st.edits, st.review_reminded, REVIEW_BUDGET
     ));
-    emit_context(
-        "Stop",
-        "[review reminder] This session edited files but review_change was never called. If the changes are risky, \
-         subtle, or hard to reverse, request the review_change tool before declaring done; if they are trivial \
-         (docs, formatting, one-liners), ignore this reminder.",
-    );
+    let out = json!({
+        "continue": true,
+        "stopReason": "[review reminder] This turn is ending with file edits but review_change was never called. \
+         If the changes are risky, subtle, or hard to reverse, request the review_change tool now; if they are \
+         trivial (docs, formatting, one-liners) or already reviewed, just finish your reply without further tool \
+         calls and the turn will end."
+    });
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "{out}");
+    let _ = stdout.flush();
 }
 
 // should_remind_review: files were changed, no review call (success OR failure)
