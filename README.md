@@ -6,7 +6,7 @@ A ZCode port of Anthropic's [advisor tool](https://platform.claude.com/docs/en/a
 
 ## System overview
 
-One binary, two modes, three trigger points:
+One binary, two modes, five trigger surfaces (plus one bookkeeping hook):
 
 | Trigger | Mechanism | Who decides timing |
 |---|---|---|
@@ -105,6 +105,30 @@ Restart your ZCode session for this to take effect. The tool is exposed as `mcp_
 
 Consider also adding advisor usage guidelines to your user instructions file (`~/.zcode/AGENTS.md`): "scoping isn't substantive work; consult once before settling on an approach and once before declaring done; treat advice as a strong prior; bring conflicts back to the advisor for adjudication."
 
+## Hook setup recommendations
+
+All five event entries in the example above are safe to register together — they share one session state file and throttle themselves. What each buys you and what it costs:
+
+| Event entry | You get | Cost / requirements |
+|---|---|---|
+| `UserPromptSubmit` → `hook UserPromptSubmit` | Task-opening consult reminder (max 3/session, prompts ≥40 chars only) | No API call; pure state check |
+| `PostToolUseFailure` → `hook PostToolUseFailure` | Stuck diagnosis: after ≥2 consecutive failures the advisor is consulted and its advice injected | The only hook that can call the advisor synchronously — keep `timeoutMs` at 120000 (covers every backend deadline) |
+| `PostToolUse` → `hook PostToolUseOK` | Bookkeeping the others depend on: resets the failure counter, counts edit-class tool calls, marks `review_change` calls | No API call. **Required by the review gate** — it produces the edit/reviewed signals |
+| `Stop` → `hook Stop` | Review gate: one wake per session when files were edited but `review_change` never ran | No API call. **Requires the `PostToolUse` entry** (without it, nothing counts edits, so the gate stays silent) |
+
+Minimal setups: MCP server alone (advisor on demand, no nudges), or MCP + `UserPromptSubmit` (adds the opening reminder). The recommended set is all five.
+
+Details that bite, all verified live on ZCode 3.11.x:
+
+- **Absolute paths only** in `command` — no `~` expansion, no PATH lookup (the app's PATH has no `~/.cargo/bin`).
+- **Hooks are resolved when a session starts.** Editing config.json does nothing for running sessions — restart ZCode. (The hook *binary* is spawned fresh per event, so rebuilding/reinstalling takes effect immediately; only config changes need the restart.)
+- **Timeouts**: 10s is generous for the three local-only hooks (they never block on anything but the state file); only `PostToolUseFailure` needs the long leash, because a stuck diagnosis waits for the advisor inside the hook.
+- **`statusMessage`** is what the UI shows while a hook runs — worth setting on `PostToolUseFailure`, which can genuinely take seconds.
+- The Stop wake emits `{"decision":"block","reason":…}` because that is the only Stop output whose text actually reaches the model: `hookSpecificOutput.additionalContext` is silently dropped and `continue:true` is ignored (both verified against the rollout). Don't "normalize" the output to the additionalContext form that the other events use.
+- After a wake, ZCode re-fires Stop with `stop_hook_active=true` (the payload carries both that and the camelCase `stopHookActive`); the hook short-circuits on either spelling, so a wake cannot loop.
+- Hooks fire in `/goal` mode too — Stop and PostToolUse were both observed during goal runs, so the gate covers autonomous goal work as well.
+- Stop fires once per turn; even a silent decision logs one `decision=silent` trace line per turn. Log rotation absorbs the volume.
+
 ## Configuration
 
 Without a config file everything runs on the defaults (local Ollama) — the two built-in methods need no configuration. To change backend or knobs, create a TOML file at the OS-conventional config location:
@@ -201,9 +225,9 @@ Runtime artifacts are concentrated in a single data directory (`util::data_dir()
 | macOS | `~/Library/Application Support/zcode-consultant/` |
 | Windows | `%LOCALAPPDATA%\zcode-consultant\` |
 
-- **`consultant.log` (+ rotated `.1`)** — the behavior trace: "what we did, and why". Format: `<RFC3339 UTC> pid=<pid> mode=<server|hook> <LEVEL> <key=value>`, one event per line: the consult lifecycle (question digest → rollout match → `done t=4.2s ctx=48231B advice=1706B` / `failed err=…`) and every hook decision point (`decision=remind open=2/3`, `decision=silent reason=consulted|budget|cooldown|short-prompt`…). To answer "why did the advisor respond that way", grep `question=`/`sess=`; for "why didn't the hook fire", read `decision=silent reason=`. Past 2MB the log keeps one generation and restarts (best-effort across the razor-thin window where several processes cross the threshold at once — at worst an old generation is lost, never line integrity); concurrent writes from multiple processes stay whole thanks to O_APPEND + single-line writes; write failures are dropped silently — the logging system must never fail a task.
-- **`hooks-debug.log`** — the raw capture: "what ZCode fed us" (the full stdin of every hook invocation, restarting past 2MB). Use it to confirm ZCode's actual field names.
-- **`state/<sess>.state.json`** — hook throttle counters (reminder/failure/stuck/consulted). Concurrent hooks writing the same session's file can interleave (truncate+write isn't atomic) — corruption only affects throttle counters and self-heals on the next successful write; MCP-side consults are already serialized by a mutex and are unaffected.
+- **`consultant.log` (+ rotated `.1`)** — the behavior trace: "what we did, and why". Format: `<RFC3339 UTC> pid=<pid> mode=<server|hook> <LEVEL> <key=value>`, one event per line: the consult lifecycle (question digest → rollout match → `done t=4.2s ctx=48231B advice=1706B` / `failed err=…`) and every hook decision point (`decision=remind open=2/3`; `decision=silent reason=consulted|budget|cooldown|short-prompt`; review gate: `reason=reviewed|no-edits|budget|stop-hook-active`…). To answer "why did the advisor respond that way", grep `question=`/`sess=`; for "why didn't the hook fire", read `decision=silent reason=`. Past 2MB the log keeps one generation and restarts (best-effort across the razor-thin window where several processes cross the threshold at once — at worst an old generation is lost, never line integrity); concurrent writes from multiple processes stay whole thanks to O_APPEND + single-line writes; write failures are dropped silently — the logging system must never fail a task.
+- **`hooks-debug.log`** — the raw capture: "what ZCode fed us" (the full stdin of every hook invocation, restarting past 2MB). Use it to confirm ZCode's actual field names (e.g. PostToolUse payloads carry `tool_name` and both `sessionId`/`session_id`; Stop payloads carry `stop_hook_active` and `stopHookActive`).
+- **`state/<sess>.state.json`** — hook throttle counters (reminder/failure/stuck/consulted plus the review gate's edits/reviewed/review_reminded). Concurrent hooks writing the same session's file can interleave (truncate+write isn't atomic) — corruption only affects throttle counters and self-heals on the next successful write; MCP-side consults are already serialized by a mutex and are unaffected.
 
 **Levels**: just the two severity markers INFO/ERROR (so ERROR lines can be grepped out), always on, **zero config and zero switches** — a behavior trace should simply record everything; reproducing content is what the rollout files are for (below). The files are 0600 (unix) inside your home directory.
 
@@ -236,7 +260,19 @@ cargo test
 
 # Hook (no API call; the reminder only fires for prompts of ≥40 chars)
 echo '{"prompt":"please refactor the parser module and add regression tests for the edge cases","session_id":"s1"}' | ~/.cargo/bin/zcode-consultant hook UserPromptSubmit
+
+# Review gate chain (no API call): count an edit, then Stop wakes with
+# {"decision":"block","reason":"[review reminder] …"}; after a review_change
+# call (success OR failure) the same Stop is silent
+echo '{"session_id":"s1","tool_name":"Edit"}' | ~/.cargo/bin/zcode-consultant hook PostToolUseOK
+echo '{"session_id":"s1"}' | ~/.cargo/bin/zcode-consultant hook Stop
+echo '{"session_id":"s1","tool_name":"mcp__zcode-consultant__review_change"}' | ~/.cargo/bin/zcode-consultant hook PostToolUseOK
+echo '{"session_id":"s1"}' | ~/.cargo/bin/zcode-consultant hook Stop   # no output
+rm ~/.local/share/zcode-consultant/state/s1.state.json   # clean up the test state
 ```
+
+`zcode-consultant --version` prints the package version (3.1.5) and exits —
+it does not fall through to server mode.
 
 **Reproducing content**: consultant.log records only structural traces (decisions, outcomes, timings, sizes), never content — "what the advisor actually saw" (the full question, the conversation view, the advice text) is preserved natively and permanently in ZCode's rollout files:
 
