@@ -521,6 +521,7 @@ mod tests {
         assert_eq!(c.reviewer.bin, "/opt/claude");
         assert_eq!(c.reviewer.model, "sonnet");
         // [reviewer] overrides win over inheritance
+        std::env::set_var("ZCA_TEST_DIR", "/interp-worked"); // don't rely on interpolation_rules' env (parallel tests)
         let c = from_toml_str(
             "backend = \"claude\"\n[claude]\nmodel = \"sonnet\"\n[reviewer]\nmodel = \"opus\"\ntimeout_secs = 60\nadd_dirs = [\"/tmp/probe\", \"${ZCA_TEST_DIR}\"]",
         )
