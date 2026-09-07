@@ -54,15 +54,17 @@ jobs:
           sudo apt-get install -y musl-tools
       - name: install musl C cross toolchain (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
+        # apt's gnu cross gcc compiles ring's freestanding C; musl.cc is
+        # routinely unreachable from GitHub runners
         run: |
-          curl -sSfL https://musl.cc/aarch64-linux-musl-cross.tgz | tar -xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
       - name: package (unix)
         if: runner.os != 'Windows'
         run: tar -czf zcode-advisor-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release zcode-advisor

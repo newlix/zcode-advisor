@@ -14,16 +14,15 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       # rustls (openai backend) pulls in ring, which compiles C for the target:
-      # musl-tools provides the x86_64 musl gcc wrapper, musl.cc the aarch64
-      # musl cross toolchain (the cc crate auto-detects aarch64-linux-musl-gcc).
-      # TODO: pin the musl.cc tarball (sha256sum) so supply-chain audits don't
-      # depend on musl.cc's own integrity alone
+      # musl-tools provides the x86_64 musl gcc wrapper; for aarch64 we use the
+      # apt gcc-aarch64-linux-gnu cross gcc (musl.cc would also work but is
+      # routinely unreachable from GitHub runners — curl timed out there).
+      # Linking is done by rust-lld in both cases; ring's C objects are
+      # freestanding, so a gnu-target gcc is fine for compiling them.
       - name: install musl C cross toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          curl -sSfL https://musl.cc/aarch64-linux-musl-cross.tgz | tar -xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
       - run: cargo test --release --locked
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
         env:
@@ -32,7 +31,7 @@ jobs:
       - run: cargo build --release --locked --target aarch64-unknown-linux-musl
         env:
           RUSTFLAGS: -C linker=rust-lld
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
 
   windows:
     runs-on: windows-latest
