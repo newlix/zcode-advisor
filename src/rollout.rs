@@ -1,10 +1,11 @@
-// Rollout lookup: identify "which session is calling consult_advisor".
-// The response that calls the tool is necessarily already on disk (tool
-// execution happens after the response completes), so among recently active
-// non-subagent rollout files, find the one whose last line carries a
-// consult_advisor toolCall with an exactly matching question, and use its
-// sessionId for attribution — no mtime guessing, no env-var dependence, and
-// correct attribution even with parallel ZCode sessions.
+// Rollout lookup: identify "which session is calling consult_advisor /
+// review_change". The response that calls the tool is necessarily already on
+// disk (tool execution happens after the response completes), so among
+// recently active non-subagent rollout files, find the one whose last line
+// carries a consult_advisor or review_change toolCall with an exactly
+// matching question, and use its sessionId for attribution — no mtime
+// guessing, no env-var dependence, and correct attribution even with parallel
+// ZCode sessions.
 // This file corresponds to the Go version's rollout.go; parsing goes through
 // serde_json::Value (matching Go's two-stage attempt).
 
@@ -128,7 +129,12 @@ pub fn find_calling_session_in(dir: &Path, question: &str) -> Option<RolloutMatc
             .and_then(Value::as_array)
             .map(|cs| {
                 cs.iter().any(|c| {
-                    let name_ok = c.get("name").and_then(Value::as_str).is_some_and(|n| n.contains("consult_advisor"));
+                    // both tools share this attribution path: consult_advisor
+                    // and review_change (without review_change, reviews would
+                    // never match a session and lose transcript attachment)
+                    let name_ok = c.get("name").and_then(Value::as_str).is_some_and(|n| {
+                        n.contains("consult_advisor") || n.contains("review_change")
+                    });
                     name_ok && c.get("input").and_then(|i| i.get("question")).and_then(Value::as_str) == Some(question)
                 })
             })
@@ -288,6 +294,10 @@ mod tests {
     // multibyte text (trim, condense, byte-vs-char boundaries) exactly as real
     // sessions produce it.
     fn sample_rollout(question: &str) -> String {
+        sample_rollout_with_tool("mcp__zcode-advisor__consult_advisor", question)
+    }
+
+    fn sample_rollout_with_tool(tool_name: &str, question: &str) -> String {
         json!({
             "sessionId": "sess_abc12345-1111",
             "request": {"messages": [
@@ -301,7 +311,7 @@ mod tests {
             ]},
             "response": {
                 "text": "  我想先諮詢顧問再動手  ",
-                "toolCalls": [{"name": "mcp__zcode-advisor__consult_advisor", "input": {"question": question, "context": "x"}}]
+                "toolCalls": [{"name": tool_name, "input": {"question": question, "context": "x"}}]
             }
         })
         .to_string()
@@ -328,6 +338,31 @@ mod tests {
         assert!(tu.contains("…(truncated)"), "{tu}");
 
         assert!(find_calling_session_in(&dir, "no-such-question").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_review_sessions_too() {
+        // review_change calls go through the same attribution path — a name
+        // filter that only knows consult_advisor would silently drop every
+        // review's transcript attachment
+        let dir = std::env::temp_dir().join(format!("zca-rollout-review-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_rollout(
+            &dir,
+            "model-io-sess_def67890-2222.jsonl",
+            &[sample_rollout_with_tool("mcp__zcode-advisor__review_change", "RQ1")],
+        );
+        let m = find_calling_session_in(&dir, "RQ1").expect("review call should match");
+        assert_eq!(m.session_id, "sess_abc12345-1111");
+        assert!(!m.preamble.is_empty());
+        // other tools with a matching question still don't match
+        write_rollout(
+            &dir,
+            "model-io-sess_fff00000-3333.jsonl",
+            &[sample_rollout_with_tool("mcp__other__read_something", "RQ2")],
+        );
+        assert!(find_calling_session_in(&dir, "RQ2").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

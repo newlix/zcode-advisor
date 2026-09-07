@@ -194,7 +194,11 @@ impl Advisor {
         let context = context.unwrap_or_default();
         // try_lock, not lock: a second review request while one runs holds its
         // MCP request open for up to the reviewer timeout behind it — fail
-        // fast instead; the caller can retry when the workspace is quiet
+        // fast instead; the caller can retry when the workspace is quiet.
+        // Known soft edge: if the client disconnects mid-review, this future
+        // (and the lock) drop while the detached blocking task runs on — a
+        // new review may then overlap the orphan; benign because the child is
+        // read-only and the orphan's output is discarded.
         let _guard = match self.review_lock.try_lock() {
             Ok(g) => g,
             Err(_) => {
@@ -298,8 +302,8 @@ pub fn run_server() {
     // moves after the HTTP, this "safe cutoff" guarantee is void.
     rt.shutdown_timeout(Duration::from_secs(5));
     if CONSULT_IN_FLIGHT.load(Ordering::SeqCst) {
-        eprintln!("advisor: shutdown cut an in-flight consult (client gone; state writes happen before HTTP, nothing half-written)");
-        logger::info("shutdown cut an in-flight consult (client gone; state writes happen before HTTP, nothing half-written)");
+        eprintln!("advisor: shutdown cut an in-flight call (consult/review; client gone; state writes happen before HTTP, nothing half-written)");
+        logger::info("shutdown cut an in-flight call (consult/review; client gone; state writes happen before HTTP, nothing half-written)");
     }
     if let Err(e) = result {
         eprintln!("advisor: server error: {e}");
