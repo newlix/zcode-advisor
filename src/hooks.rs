@@ -1,9 +1,9 @@
-// Hook mode: `zcode-advisor hook <Event>`, fed event JSON on stdin by ZCode's
+// Hook mode: `zcode-consultant hook <Event>`, fed event JSON on stdin by ZCode's
 // hooks mechanism. The advisor is consulted only at rule-detectable key
 // moments — task opening (a substantial prompt) and consecutive tool failures
 // (stuck); every other event passes through silently, and advisor failures
 // also pass through silently — never block real work.
-// Every decision point writes one trace line to advisor.log (decision=…
+// Every decision point writes one trace line to consultant.log (decision=…
 // reason=…) for post-hoc forensics.
 
 use std::fs;
@@ -29,7 +29,7 @@ pub fn run_hook(event: &str) {
     // 4MB cap, matching the Go version's io.LimitReader(os.Stdin, 4<<20)
     let mut stdin = Vec::new();
     let _ = std::io::stdin().take(4 << 20).read_to_end(&mut stdin);
-    debug_log(event, &stdin); // raw capture of "what ZCode fed us"; behavior traces go to advisor.log
+    debug_log(event, &stdin); // raw capture of "what ZCode fed us"; behavior traces go to consultant.log
 
     let m: Value = serde_json::from_slice(&stdin).unwrap_or(Value::Null); // undecodable → treat all fields as missing
 
@@ -45,7 +45,7 @@ pub fn run_hook(event: &str) {
             logger::info(&format!("hook event=PostToolUseOK sess={sess} decision=fail-reset"));
         }
         _ => {
-            eprintln!("advisor-hook: unknown hook event: {event}");
+            eprintln!("zcode-consultant-hook: unknown hook event: {event}");
             logger::info(&format!("hook event={event} decision=silent reason=unknown-event"));
         }
     }
@@ -152,7 +152,7 @@ fn hook_post_tool_use_failure(m: &Value) {
             emit_context("PostToolUseFailure", &format!("[advisor stuck advice · {}]\n{advice}", advisor_label()));
         }
         Err(e) => {
-            eprintln!("advisor-hook: stuck advice skipped: {e}");
+            eprintln!("zcode-consultant-hook: stuck advice skipped: {e}");
             logger::info(&format!(
                 "hook event=PostToolUseFailure sess={sess} stuck advice skipped t={:?} err={e}",
                 started.elapsed()
@@ -303,7 +303,7 @@ fn sanitize_session(s: &str) -> String {
 }
 
 // debugLog: archive every hook's raw input ("what ZCode fed us") to confirm
-// actual field names; rotates past 2MB. Behavior traces live in advisor.log
+// actual field names; rotates past 2MB. Behavior traces live in consultant.log
 // (the logger module) — different responsibilities.
 fn debug_log(event: &str, stdin: &[u8]) {
     let path = data_dir().join("hooks-debug.log");

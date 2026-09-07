@@ -1,6 +1,6 @@
 # Release pipeline: pushing a v* tag builds binaries for five platforms and
 # attaches them, with checksums, to a GitHub Release.
-# Naming: zcode-advisor-<tag>-<target>.tar.gz (.zip on Windows)
+# Naming: zcode-consultant-<tag>-<target>.tar.gz (.zip on Windows)
 # Linux uses static musl linking (runs on any distro); aarch64 cross-compiles
 # with rust-lld. Since the openai backend pulled in rustls/ring (C code), the
 # musl targets need a C cross toolchain: musl-tools (x86_64) and musl.cc
@@ -67,15 +67,15 @@ jobs:
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
       - name: package (unix)
         if: runner.os != 'Windows'
-        run: tar -czf zcode-advisor-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release zcode-advisor
+        run: tar -czf zcode-consultant-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release zcode-consultant
       - name: package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target\${{ matrix.target }}\release\zcode-advisor.exe -DestinationPath zcode-advisor-${{ github.ref_name }}-${{ matrix.target }}.zip
+        run: Compress-Archive -Path target\${{ matrix.target }}\release\zcode-consultant.exe -DestinationPath zcode-consultant-${{ github.ref_name }}-${{ matrix.target }}.zip
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: zcode-advisor-*
+          path: zcode-consultant-*
           if-no-files-found: error
 
   release:
@@ -86,10 +86,10 @@ jobs:
         with:
           merge-multiple: true
       - name: checksums
-        run: sha256sum zcode-advisor-* | tee checksums.txt
+        run: sha256sum zcode-consultant-* | tee checksums.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            zcode-advisor-*
+            zcode-consultant-*
             checksums.txt
           generate_release_notes: true

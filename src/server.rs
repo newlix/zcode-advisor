@@ -263,14 +263,14 @@ pub fn run_server() {
     let cfg = config::global();
     // logging always goes to stderr; stdout carries only the MCP protocol
     eprintln!(
-        "advisor: backend={} timeout={:?} | reviewer={} timeout={:?}",
+        "zcode-consultant: backend={} timeout={:?} | reviewer={} timeout={:?}",
         cfg.backend.kind_and_summary(),
         cfg.timeout,
         cfg.reviewer.summary(),
         cfg.reviewer.timeout
     );
     if let Some(w) = &cfg.warning {
-        eprintln!("advisor: {w}");
+        eprintln!("zcode-consultant: {w}");
         logger::error(&format!("config fallback {}", w));
     }
     logger::info(&format!(
@@ -283,7 +283,7 @@ pub fn run_server() {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("advisor: runtime init failed: {e}");
+            eprintln!("zcode-consultant: runtime init failed: {e}");
             logger::error(&format!("runtime init failed err={e}"));
             return;
         }
@@ -302,11 +302,11 @@ pub fn run_server() {
     // moves after the HTTP, this "safe cutoff" guarantee is void.
     rt.shutdown_timeout(Duration::from_secs(5));
     if CONSULT_IN_FLIGHT.load(Ordering::SeqCst) {
-        eprintln!("advisor: shutdown cut an in-flight call (consult/review; client gone; state writes happen before HTTP, nothing half-written)");
+        eprintln!("zcode-consultant: shutdown cut an in-flight call (consult/review; client gone; state writes happen before HTTP, nothing half-written)");
         logger::info("shutdown cut an in-flight call (consult/review; client gone; state writes happen before HTTP, nothing half-written)");
     }
     if let Err(e) = result {
-        eprintln!("advisor: server error: {e}");
+        eprintln!("zcode-consultant: server error: {e}");
         logger::error(&format!("server error err={e:?}"));
     }
 }
@@ -325,7 +325,7 @@ struct SessionParts {
 fn find_session(question: &str) -> SessionParts {
     match rollout::find_calling_session(question) {
         Some(m) => {
-            eprintln!("advisor: rollout match: session={} file={}", m.session_id, m.path.display());
+            eprintln!("zcode-consultant: rollout match: session={} file={}", m.session_id, m.path.display());
             logger::info(&format!("rollout match session={} file={}", m.session_id, m.path.display()));
             // the first 8 chars of the session id (sess_<uuid>) tag attribution;
             // from_utf8_lossy on non-ASCII mirrors the invalid-UTF-8 replacement

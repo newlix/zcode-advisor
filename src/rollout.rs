@@ -294,7 +294,7 @@ mod tests {
     // multibyte text (trim, condense, byte-vs-char boundaries) exactly as real
     // sessions produce it.
     fn sample_rollout(question: &str) -> String {
-        sample_rollout_with_tool("mcp__zcode-advisor__consult_advisor", question)
+        sample_rollout_with_tool("mcp__zcode-consultant__consult_advisor", question)
     }
 
     fn sample_rollout_with_tool(tool_name: &str, question: &str) -> String {
@@ -351,7 +351,7 @@ mod tests {
         write_rollout(
             &dir,
             "model-io-sess_def67890-2222.jsonl",
-            &[sample_rollout_with_tool("mcp__zcode-advisor__review_change", "RQ1")],
+            &[sample_rollout_with_tool("mcp__zcode-consultant__review_change", "RQ1")],
         );
         let m = find_calling_session_in(&dir, "RQ1").expect("review call should match");
         assert_eq!(m.session_id, "sess_abc12345-1111");

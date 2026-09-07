@@ -2,7 +2,7 @@
 // a given rollout directory, for byte-exact diffing against the retired Go
 // version's (~/.zcode/zcode-advisor) comparison shim:
 //   cargo run --release --example parity -- <rollout-dir> <question>
-use zcode_advisor::rollout::find_calling_session_in;
+use zcode_consultant::rollout::find_calling_session_in;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -24,8 +24,8 @@ use serde::Deserialize;
 use crate::util;
 
 // Path override for tests and unusual setups; takes precedence over the
-// standard location. (No ZCODE_ADVISOR_* variable exists in ZCode itself.)
-pub const ENV_CONFIG_PATH: &str = "ZCODE_ADVISOR_CONFIG";
+// standard location. (No ZCODE_CONSULTANT_* variable exists in ZCode itself.)
+pub const ENV_CONFIG_PATH: &str = "ZCODE_CONSULTANT_CONFIG";
 
 // Built-in defaults — the previously hard-coded values. One knob per concern;
 // anything here can be overridden in the config file.
@@ -156,7 +156,7 @@ pub fn default_config() -> Config {
     }
 }
 
-// config_path: $ZCODE_ADVISOR_CONFIG, else the OS-conventional config
+// config_path: $ZCODE_CONSULTANT_CONFIG, else the OS-conventional config
 // directory (Linux ~/.config honoring $XDG_CONFIG_HOME, macOS
 // ~/Library/Application Support, Windows %APPDATA%).
 pub fn config_path() -> PathBuf {
@@ -166,8 +166,8 @@ pub fn config_path() -> PathBuf {
         }
     }
     match dirs::config_dir() {
-        Some(d) => d.join("zcode-advisor").join("config.toml"),
-        None => util::home_dir().join(".config").join("zcode-advisor").join("config.toml"),
+        Some(d) => d.join("zcode-consultant").join("config.toml"),
+        None => util::home_dir().join(".config").join("zcode-consultant").join("config.toml"),
     }
 }
 
@@ -184,7 +184,7 @@ pub fn load() -> Config {
             if override_set {
                 return with_warning(
                     &path,
-                    "set via ZCODE_ADVISOR_CONFIG but the file does not exist".to_string(),
+                    "set via ZCODE_CONSULTANT_CONFIG but the file does not exist".to_string(),
                 );
             }
             return default_config();

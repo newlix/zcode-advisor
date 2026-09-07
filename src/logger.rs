@@ -1,4 +1,4 @@
-// Behavior-trace log (advisor.log): division of labor with hooks-debug.log —
+// Behavior-trace log (consultant.log): division of labor with hooks-debug.log —
 // that one records "what ZCode fed us" (raw stdin captures), this one records
 // "what we did and why" (consult lifecycle, hook decision points). The purpose
 // is post-hoc forensics: why the advisor answered the way it did, why a hook
@@ -81,7 +81,7 @@ fn log(level: Level, msg: &str) {
 }
 
 fn log_path() -> PathBuf {
-    crate::util::data_dir().join("advisor.log")
+    crate::util::data_dir().join("consultant.log")
 }
 
 // write_line: rotate past the threshold first, then append the whole line with
@@ -99,7 +99,7 @@ fn write_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
-// rotate: rename keeping one generation (advisor.log.1); if the rename fails
+// rotate: rename keeping one generation (consultant.log.1); if the rename fails
 // (e.g. the file is held open), fall back to truncating and reopening. Known
 // accepted race: when multiple processes cross the rotation threshold at the
 // same instant, the later rename may clobber the just-moved generation (the
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn appends_lines_to_same_file() {
         let dir = temp_log("append");
-        let p = dir.join("advisor.log");
+        let p = dir.join("consultant.log");
         log_to(&p, "line1");
         log_to(&p, "line2");
         let content = fs::read_to_string(&p).unwrap();
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn rotates_over_threshold_keeping_one_generation() {
         let dir = temp_log("rotate");
-        let p = dir.join("advisor.log");
+        let p = dir.join("consultant.log");
         log_to(&p, "first-line");
         // grow the file past the rotation threshold via append (simulating
         // long-term accumulation; fs::write truncates, so it can't be used)
@@ -158,7 +158,7 @@ mod tests {
         log_to(&p, "after-rotate");
         // the whole old file (first-line + junk) moves to .1; the new file
         // holds only after-rotate
-        let rotated = fs::read(dir.join("advisor.log.1")).unwrap();
+        let rotated = fs::read(dir.join("consultant.log.1")).unwrap();
         assert!(rotated.starts_with(b"first-line\n"), "old content must survive in .1");
         assert!(rotated.len() > ROTATE_BYTES as usize);
         assert_eq!(fs::read_to_string(&p).unwrap(), "after-rotate\n");
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn concurrent_writers_do_not_corrupt_lines() {
         let dir = temp_log("conc");
-        let p = dir.join("advisor.log");
+        let p = dir.join("consultant.log");
         let writers: Vec<_> = (0..4)
             .map(|w| {
                 let p = p.clone();

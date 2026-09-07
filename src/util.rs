@@ -27,16 +27,16 @@ pub fn home_dir() -> PathBuf {
 }
 
 // data_dir: the cross-platform root for runtime artifacts (state/,
-// advisor.log, hooks-debug.log). dirs::data_local_dir() lands in each OS's
+// consultant.log, hooks-debug.log). dirs::data_local_dir() lands in each OS's
 // conventional location: Linux ~/.local/share (honoring $XDG_DATA_HOME),
 // macOS ~/Library/Application Support, Windows %LOCALAPPDATA%; on resolution
-// failure (rare) it falls back to .zcode-advisor under home. Deliberately not
+// failure (rare) it falls back to .zcode-consultant under home. Deliberately not
 // the Go version's ~/.zcode/zcode-advisor — that's the legacy Go directory;
 // this version is decoupled from it.
 pub fn data_dir() -> PathBuf {
     match dirs::data_local_dir() {
-        Some(d) => d.join("zcode-advisor"),
-        None => home_dir().join(".zcode-advisor"),
+        Some(d) => d.join("zcode-consultant"),
+        None => home_dir().join(".zcode-consultant"),
     }
 }
 
@@ -147,9 +147,9 @@ mod tests {
 
     #[test]
     fn data_dir_is_namespaced() {
-        // wherever it lands, the last component must be zcode-advisor
+        // wherever it lands, the last component must be zcode-consultant
         // (cross-platform consistency guaranteed by dirs)
         let d = data_dir();
-        assert!(d.ends_with("zcode-advisor"), "{d:?}");
+        assert!(d.ends_with("zcode-consultant"), "{d:?}");
     }
 }

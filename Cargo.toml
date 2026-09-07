@@ -1,5 +1,5 @@
 [package]
-name = "zcode-advisor"
+name = "zcode-consultant"
 version = "3.1.0"
 edition = "2021"
 description = "ZCode advisor tool: MCP stdio server (rmcp) + hooks"

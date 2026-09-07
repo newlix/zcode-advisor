@@ -1,4 +1,4 @@
-# zcode-advisor
+# zcode-consultant
 
 A ZCode port of Anthropic's [advisor tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool): lets a cheap, fast executor model (glm-5.3-flash) ask a stronger advisor model for strategic advice at key moments. The advisor backend is picked in an optional TOML config file (see "Configuration"): the local Ollama `kimi-k3:cloud` by default (zero config), the Claude Code CLI, or any OpenAI-compatible HTTPS endpoint with a bearer key. Single binary, two modes (MCP stdio server / hook).
 
@@ -43,10 +43,10 @@ The `question` parameter stays as a "focusing lens" — more focused than the or
 
 ## Installation
 
-Requires Rust 1.91+. Install from git with cargo (the binary lands at `~/.cargo/bin/zcode-advisor`):
+Requires Rust 1.91+. Install from git with cargo (the binary lands at `~/.cargo/bin/zcode-consultant`):
 
 ```bash
-cargo install --git https://github.com/newlix/zcode-advisor
+cargo install --git https://github.com/newlix/zcode-consultant
 ```
 
 If `~/.cargo/bin` isn't on your PATH yet, add it to your shell config (zsh: `~/.zshrc`, bash: `~/.bashrc`; on Windows the location is `%USERPROFILE%\.cargo\bin` — same idea):
@@ -55,19 +55,19 @@ If `~/.cargo/bin` isn't on your PATH yet, add it to your shell config (zsh: `~/.
 echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
 ```
 
-Restart your shell (or `source ~/.zshrc`) and confirm `which zcode-advisor` resolves. ZCode config doesn't expand `~`, so in the config example below replace the command with the absolute path that `which` prints.
+Restart your shell (or `source ~/.zshrc`) and confirm `which zcode-consultant` resolves. ZCode config doesn't expand `~`, so in the config example below replace the command with the absolute path that `which` prints.
 
 State files and logs land in each OS's conventional data directory (see "Logging and troubleshooting").
 
-Register it in `~/.zcode/cli/config.json` (hooks require `hooks.enabled: true`; the command shows `/home/you/.cargo/bin/zcode-advisor` as an example — replace it with your own absolute path):
+Register it in `~/.zcode/cli/config.json` (hooks require `hooks.enabled: true`; the command shows `/home/you/.cargo/bin/zcode-consultant` as an example — replace it with your own absolute path):
 
 ```json
 {
   "mcp": {
     "servers": {
-      "zcode-advisor": {
+      "zcode-consultant": {
         "type": "stdio",
-        "command": "/home/you/.cargo/bin/zcode-advisor",
+        "command": "/home/you/.cargo/bin/zcode-consultant",
         "timeoutMs": 120000
       }
     }
@@ -77,17 +77,17 @@ Register it in `~/.zcode/cli/config.json` (hooks require `hooks.enabled: true`; 
     "events": {
       "UserPromptSubmit": [
         { "hooks": [{ "type": "command",
-            "command": "/home/you/.cargo/bin/zcode-advisor hook UserPromptSubmit",
+            "command": "/home/you/.cargo/bin/zcode-consultant hook UserPromptSubmit",
             "timeoutMs": 10000, "statusMessage": "advisor consult reminder" }] }
       ],
       "PostToolUseFailure": [
         { "hooks": [{ "type": "command",
-            "command": "/home/you/.cargo/bin/zcode-advisor hook PostToolUseFailure",
+            "command": "/home/you/.cargo/bin/zcode-consultant hook PostToolUseFailure",
             "timeoutMs": 120000, "statusMessage": "advisor stuck diagnosis…" }] }
       ],
       "PostToolUse": [
         { "hooks": [{ "type": "command",
-            "command": "/home/you/.cargo/bin/zcode-advisor hook PostToolUseOK",
+            "command": "/home/you/.cargo/bin/zcode-consultant hook PostToolUseOK",
             "timeoutMs": 10000 }] }
       ]
     }
@@ -95,7 +95,7 @@ Register it in `~/.zcode/cli/config.json` (hooks require `hooks.enabled: true`; 
 }
 ```
 
-Restart your ZCode session for this to take effect. The tool is exposed as `mcp__zcode-advisor__consult_advisor`, with parameters `question` (required) + `context` (optional — only material that isn't already in the conversation).
+Restart your ZCode session for this to take effect. The tool is exposed as `mcp__zcode-consultant__consult_advisor`, with parameters `question` (required) + `context` (optional — only material that isn't already in the conversation).
 
 Consider also adding advisor usage guidelines to your user instructions file (`~/.zcode/AGENTS.md`): "scoping isn't substantive work; consult once before settling on an approach and once before declaring done; treat advice as a strong prior; bring conflicts back to the advisor for adjudication."
 
@@ -105,11 +105,11 @@ Without a config file everything runs on the defaults (local Ollama) — the two
 
 | OS | Location |
 |---|---|
-| Linux | `~/.config/zcode-advisor/config.toml` (honors `$XDG_CONFIG_HOME`) |
-| macOS | `~/Library/Application Support/zcode-advisor/config.toml` |
-| Windows | `%APPDATA%\zcode-advisor\config.toml` |
+| Linux | `~/.config/zcode-consultant/config.toml` (honors `$XDG_CONFIG_HOME`) |
+| macOS | `~/Library/Application Support/zcode-consultant/config.toml` |
+| Windows | `%APPDATA%\zcode-consultant\config.toml` |
 
-`ZCODE_ADVISOR_CONFIG=<path>` overrides the location (handy for tests). Full schema (every field optional unless noted; unknown keys are rejected so typos fail loudly):
+`ZCODE_CONSULTANT_CONFIG=<path>` overrides the location (handy for tests). Full schema (every field optional unless noted; unknown keys are rejected so typos fail loudly):
 
 ```toml
 # backend = "ollama"   # "ollama" | "claude" | "openai" (default: ollama)
@@ -160,7 +160,7 @@ Single-pass: a fallback is never re-expanded. The openai backend's log line prin
 
 ### Broken config = loud fallback
 
-A missing file is silently fine (defaults). A present-but-broken file (bad TOML, unknown key, unset `${VAR}`, missing required field, unknown backend name) also falls back to defaults — the advisor must never hold up real work — but loudly: one stderr line, an ERROR entry in advisor.log, and a `[config warning] …` prefix on the next consult's result, so a silent ollama fallback while you configured openai can't waste an afternoon.
+A missing file is silently fine (defaults). A present-but-broken file (bad TOML, unknown key, unset `${VAR}`, missing required field, unknown backend name) also falls back to defaults — the advisor must never hold up real work — but loudly: one stderr line, an ERROR entry in consultant.log, and a `[config warning] …` prefix on the next consult's result, so a silent ollama fallback while you configured openai can't waste an afternoon.
 
 ### Known limitations
 
@@ -173,17 +173,17 @@ Backend/model/endpoint/timeouts all live in the config file now. What still live
 
 ## Files
 
-- The installed executable lives at `~/.cargo/bin/zcode-advisor` (where cargo install puts it); the source is this repo
+- The installed executable lives at `~/.cargo/bin/zcode-consultant` (where cargo install puts it); the source is this repo
 - `src/server.rs` — the rmcp MCP server: the `Advisor` handler, the `consult_advisor` + `review_change` tools (spawn_blocking + serialization), `ask_advisor` (backend dispatch + the shared OpenAI-wire-format path), the advisor/reviewer system prompts
 - `src/config.rs` — the optional TOML config file: backend selection (ollama / claude / openai), `[reviewer]` knobs, `${VAR}` interpolation, defaults, loud-fallback-on-broken-file policy
 - `src/claude.rs` — the Claude Code CLI backends: `claude -p` subprocess (pure model call for consults, `--allowedTools` read-only agentic pass for reviews), PATH resolution with fallbacks, stdin/stdout/stderr pipes with caps, deadline kill
 - `src/hooks.rs` — the three hook handlers, the session state file (`state/<sess>.state.json`: reminder/failure/stuck/consulted counters), the reminder text
 - `src/rollout.rs` — UUID lookup, conversation compression, current-turn monologue extraction
 - `src/http.rs` — a hand-written HTTP/1.1 client (the Ollama endpoint is plain HTTP on localhost; deadline semantics, Content-Length/chunked/close-delimited bodies, a 1MB body cap). The openai backend talks HTTPS through ureq/rustls instead — a one-shot plain-HTTP call to Ollama doesn't justify a client dependency, and the hand-rolled client keeps the default path dependency-free
-- `src/logger.rs` — the behavior-trace log (advisor.log): severity markers, 2MB rotation keeping one generation, multi-process-safe single-line writes via O_APPEND, silent on write failure
+- `src/logger.rs` — the behavior-trace log (consultant.log): severity markers, 2MB rotation keeping one generation, multi-process-safe single-line writes via O_APPEND, silent on write failure
 - `src/util.rs` — shared utilities: char-boundary-safe truncation, cross-platform data directory (dirs), RFC3339 UTC, private-permission file creation
 
-Runtime artifacts (all gitignored; locations in "Logging and troubleshooting"): `target/`, `state/`, `advisor.log*`, `hooks-debug.log`.
+Runtime artifacts (all gitignored; locations in "Logging and troubleshooting"): `target/`, `state/`, `consultant.log*`, `hooks-debug.log`.
 
 ## Logging and troubleshooting
 
@@ -191,11 +191,11 @@ Runtime artifacts are concentrated in a single data directory (`util::data_dir()
 
 | OS | Location |
 |---|---|
-| Linux | `~/.local/share/zcode-advisor/` (honors `$XDG_DATA_HOME`) |
-| macOS | `~/Library/Application Support/zcode-advisor/` |
-| Windows | `%LOCALAPPDATA%\zcode-advisor\` |
+| Linux | `~/.local/share/zcode-consultant/` (honors `$XDG_DATA_HOME`) |
+| macOS | `~/Library/Application Support/zcode-consultant/` |
+| Windows | `%LOCALAPPDATA%\zcode-consultant\` |
 
-- **`advisor.log` (+ rotated `.1`)** — the behavior trace: "what we did, and why". Format: `<RFC3339 UTC> pid=<pid> mode=<server|hook> <LEVEL> <key=value>`, one event per line: the consult lifecycle (question digest → rollout match → `done t=4.2s ctx=48231B advice=1706B` / `failed err=…`) and every hook decision point (`decision=remind open=2/3`, `decision=silent reason=consulted|budget|cooldown|short-prompt`…). To answer "why did the advisor respond that way", grep `question=`/`sess=`; for "why didn't the hook fire", read `decision=silent reason=`. Past 2MB the log keeps one generation and restarts (best-effort across the razor-thin window where several processes cross the threshold at once — at worst an old generation is lost, never line integrity); concurrent writes from multiple processes stay whole thanks to O_APPEND + single-line writes; write failures are dropped silently — the logging system must never fail a task.
+- **`consultant.log` (+ rotated `.1`)** — the behavior trace: "what we did, and why". Format: `<RFC3339 UTC> pid=<pid> mode=<server|hook> <LEVEL> <key=value>`, one event per line: the consult lifecycle (question digest → rollout match → `done t=4.2s ctx=48231B advice=1706B` / `failed err=…`) and every hook decision point (`decision=remind open=2/3`, `decision=silent reason=consulted|budget|cooldown|short-prompt`…). To answer "why did the advisor respond that way", grep `question=`/`sess=`; for "why didn't the hook fire", read `decision=silent reason=`. Past 2MB the log keeps one generation and restarts (best-effort across the razor-thin window where several processes cross the threshold at once — at worst an old generation is lost, never line integrity); concurrent writes from multiple processes stay whole thanks to O_APPEND + single-line writes; write failures are dropped silently — the logging system must never fail a task.
 - **`hooks-debug.log`** — the raw capture: "what ZCode fed us" (the full stdin of every hook invocation, restarting past 2MB). Use it to confirm ZCode's actual field names.
 - **`state/<sess>.state.json`** — hook throttle counters (reminder/failure/stuck/consulted). Concurrent hooks writing the same session's file can interleave (truncate+write isn't atomic) — corruption only affects throttle counters and self-heals on the next successful write; MCP-side consults are already serialized by a mutex and are unaffected.
 
@@ -203,7 +203,7 @@ Runtime artifacts are concentrated in a single data directory (`util::data_dir()
 
 ## Smoke tests
 
-(`cargo test` requires a clone of this repo; the binary invocations below assume the cargo install location, `~/.cargo/bin/zcode-advisor`.)
+(`cargo test` requires a clone of this repo; the binary invocations below assume the cargo install location, `~/.cargo/bin/zcode-consultant`.)
 
 ```bash
 # Unit tests (tool registration/schema, Ollama response decoding, a fake HTTP server,
@@ -215,24 +215,24 @@ cargo test
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; sleep 2 ) \
-  | ~/.cargo/bin/zcode-advisor
+  | ~/.cargo/bin/zcode-consultant
 
 # End-to-end (really calls the API; the default backend is local Ollama —
 # a reasoning model's thinking counts toward max_tokens, too small and it
 # burns out during reasoning, leaving the body empty; the error message then
 # names max_tokens in the config file. Test another backend by pointing
-# ZCODE_ADVISOR_CONFIG at a config file, e.g. one line: backend = "claude")
+# ZCODE_CONSULTANT_CONFIG at a config file, e.g. one line: backend = "claude")
 ( printf '%s\n%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"consult_advisor","arguments":{"question":"reply OK"}}}'; sleep 30 ) \
-  | ~/.cargo/bin/zcode-advisor
+  | ~/.cargo/bin/zcode-consultant
 
 # Hook (no API call; the reminder only fires for prompts of ≥40 chars)
-echo '{"prompt":"please refactor the parser module and add regression tests for the edge cases","session_id":"s1"}' | ~/.cargo/bin/zcode-advisor hook UserPromptSubmit
+echo '{"prompt":"please refactor the parser module and add regression tests for the edge cases","session_id":"s1"}' | ~/.cargo/bin/zcode-consultant hook UserPromptSubmit
 ```
 
-**Reproducing content**: advisor.log records only structural traces (decisions, outcomes, timings, sizes), never content — "what the advisor actually saw" (the full question, the conversation view, the advice text) is preserved natively and permanently in ZCode's rollout files:
+**Reproducing content**: consultant.log records only structural traces (decisions, outcomes, timings, sizes), never content — "what the advisor actually saw" (the full question, the conversation view, the advice text) is preserved natively and permanently in ZCode's rollout files:
 
 ```bash
 # Find the full question and reply of a consult
