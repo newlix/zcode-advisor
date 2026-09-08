@@ -165,7 +165,7 @@ max_tokens = 8192      # bump to 16–32k for thinking models
 model = "opus"         # optional; default = [claude].model
 tools = "Read,Grep,Glob"  # whitelist-validated at load (read-only enforced)
 add_dirs = []          # extra --add-dir entries; the workspace (server cwd) is always readable
-timeout_secs = 300     # agentic reviews are slower; the deadline kill is the only turn bound
+timeout_secs = 600     # agentic reviews are slower; the deadline kill is the only turn bound
 ```
 
 ### Backends

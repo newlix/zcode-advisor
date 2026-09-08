@@ -42,7 +42,7 @@ pub const OPENAI_TIMEOUT: Duration = Duration::from_secs(90);
 // The reviewer is always a claude CLI agentic call (the tool loop is
 // claude-CLI-specific), independent of the advisor backend choice.
 pub const REVIEWER_TOOLS: &str = "Read,Grep,Glob"; // whitelist-validated, keep read-only
-pub const REVIEWER_TIMEOUT: Duration = Duration::from_secs(300); // agentic reviews are slower
+pub const REVIEWER_TIMEOUT: Duration = Duration::from_secs(600); // agentic reviews are slower
 
 #[derive(Debug, Clone)]
 pub enum Backend {
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn reviewer_defaults_and_inheritance() {
-        // no config: read-only whitelist, 300s, claude CLI defaults
+        // no config: read-only whitelist, 600s, claude CLI defaults
         let c = from_toml_str("").unwrap();
         assert_eq!(c.reviewer.tools, REVIEWER_TOOLS);
         assert_eq!(c.reviewer.timeout, REVIEWER_TIMEOUT);
