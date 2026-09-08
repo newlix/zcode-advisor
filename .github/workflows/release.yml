@@ -17,7 +17,7 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: tag must match the Cargo.toml version (guards against tagging before bumping)
         run: |
           v="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)"
@@ -43,7 +43,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -72,7 +72,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path target\${{ matrix.target }}\release\zcode-consultant.exe -DestinationPath zcode-consultant-${{ github.ref_name }}-${{ matrix.target }}.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: zcode-consultant-*
@@ -82,12 +82,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - name: checksums
         run: sha256sum zcode-consultant-* | tee checksums.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             zcode-consultant-*
