@@ -1,0 +1,13 @@
+# Keep the GitHub Actions in the workflows current: one grouped PR per week
+# covering every outdated action, so version drift like the Node 20
+# deprecation backlog can't build up again.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
