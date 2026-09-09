@@ -271,9 +271,9 @@ fn run(bin: &Path, args: &[String], prompt: &str, timeout: Duration) -> Result<S
         // Tails are real suffixes (last_chars): the notice is the last thing
         // the CLI prints.
         let out = stdout.trim();
-        let mut msg = format!("claude CLI failed ({detail}): ");
+        let mut msg = format!("claude CLI failed ({detail})");
         if !out.is_empty() {
-            msg.push_str(&last_chars(out, 500).to_string());
+            msg.push_str(&format!(": {}", last_chars(out, 500)));
         }
         let err = stderr.trim();
         if !err.is_empty() {
