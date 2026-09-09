@@ -271,7 +271,7 @@ echo '{"session_id":"s1"}' | ~/.cargo/bin/zcode-consultant hook Stop   # no outp
 rm ~/.local/share/zcode-consultant/state/s1.state.json   # clean up the test state
 ```
 
-`zcode-consultant --version` prints the package version (3.1.5) and exits —
+`zcode-consultant --version` prints the package version (3.1.6) and exits —
 it does not fall through to server mode.
 
 **Reproducing content**: consultant.log records only structural traces (decisions, outcomes, timings, sizes), never content — "what the advisor actually saw" (the full question, the conversation view, the advice text) is preserved natively and permanently in ZCode's rollout files:
