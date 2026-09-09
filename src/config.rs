@@ -35,9 +35,10 @@ pub const OLLAMA_MAX_TOKENS: u64 = 131_072; // reasoning models burn max_tokens 
 pub const CLAUDE_BIN: &str = "claude";
 pub const CLAUDE_MODEL: &str = ""; // empty = the CLI's configured default model
 pub const OPENAI_MAX_TOKENS: u64 = 8_192; // safe floor; bump to 16–32k for thinking models
-// Cold start + large context can push a claude CLI call past a 90s budget.
 pub const OLLAMA_TIMEOUT: Duration = Duration::from_secs(90);
-pub const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
+// CLI cold start + a full conversation tail can push a one-shot claude call
+// past 3 minutes; the advisor budget matches the reviewer's.
+pub const CLAUDE_TIMEOUT: Duration = Duration::from_secs(600);
 pub const OPENAI_TIMEOUT: Duration = Duration::from_secs(90);
 // The reviewer is always a claude CLI agentic call (the tool loop is
 // claude-CLI-specific), independent of the advisor backend choice.

@@ -26,7 +26,7 @@ Design invariant: **the advisor's absence must never hold up real work** — on 
 - The blocking part of a consult (rollout lookup, the 90s HTTP call) runs via `tokio::task::spawn_blocking`; an `Arc<Mutex>` serializes the whole consult — rmcp dispatches requests concurrently, so serialization guarantees "one consult at a time" and also prevents concurrent writes to the state file.
 - Panics inside the blocking task are caught via `JoinError` and degraded to an isError result; unreachable/timed-out/empty advisor responses produce explicit error messages and detection logic (e.g. `finish_reason=length` detection).
 - Protocol details (JSON-RPC id write-back, notification handling, version negotiation) are handled by rmcp: a client-supplied `protocolVersion` inside the supported set is echoed (verified experimentally for 2024-11-05 / 2025-03-26 / 2025-06-18); unrecognized versions get rmcp's latest in return. Non-JSON lines on stdin are silently dropped — no `-32700` parse error is returned.
-- After stdin EOF there is a 5-second drain window: a consult response that completes within the window is still delivered; anything later never lands, and the process exits at most ~10 seconds after EOF (`shutdown_timeout(5s)` — it won't hold the process for an HTTP call that is already doomed to be dropped, up to the 90s deadline). An MCP client holds the pipe open while waiting for a response anyway, so in practice this changes nothing.
+- After stdin EOF there is a 5-second drain window: a consult response that completes within the window is still delivered; anything later never lands, and the process exits at most ~10 seconds after EOF (`shutdown_timeout(5s)` — it won't hold the process for a call that is already doomed to be dropped by the departing client, whatever the backend deadline). An MCP client holds the pipe open while waiting for a response anyway, so in practice this changes nothing.
 
 ## UUID-level session attribution (the core trick)
 
@@ -112,7 +112,7 @@ All five event entries in the example above are safe to register together — th
 | Event entry | You get | Cost / requirements |
 |---|---|---|
 | `UserPromptSubmit` → `hook UserPromptSubmit` | Task-opening consult reminder (max 3/session, prompts ≥40 chars only) | No API call; pure state check |
-| `PostToolUseFailure` → `hook PostToolUseFailure` | Stuck diagnosis: after ≥2 consecutive failures the advisor is consulted and its advice injected | The only hook that can call the advisor synchronously — keep `timeoutMs` at 120000 (covers every backend deadline) |
+| `PostToolUseFailure` → `hook PostToolUseFailure` | Stuck diagnosis: after ≥2 consecutive failures the advisor is consulted and its advice injected | The only hook that can call the advisor synchronously — keep `timeoutMs` at 120000 (covers the HTTP backends' 90s deadline; the claude backend's 600s deadline exceeds it, so a slow stuck-diagnosis can be cut off by the hook timeout — it is best-effort) |
 | `PostToolUse` → `hook PostToolUseOK` | Bookkeeping the others depend on: resets the failure counter, counts edit-class tool calls, marks `review_change` calls | No API call. **Required by the review gate** — it produces the edit/reviewed signals |
 | `Stop` → `hook Stop` | Review gate: one wake per session when files were edited but `review_change` never ran | No API call. **Requires the `PostToolUse` entry** (without it, nothing counts edits, so the gate stays silent) |
 
@@ -123,7 +123,7 @@ Details that bite, all verified live on ZCode 3.11.x:
 - **Absolute paths only** in `command` — no `~` expansion, no PATH lookup (the app's PATH has no `~/.cargo/bin`).
 - **Hooks are resolved when a session starts.** Editing config.json does nothing for running sessions — restart ZCode. (The hook *binary* is spawned fresh per event, so rebuilding/reinstalling takes effect immediately; only config changes need the restart.)
 - **Timeouts**: 10s is generous for the three local-only hooks (they never block on anything but the state file); only `PostToolUseFailure` needs the long leash, because a stuck diagnosis waits for the advisor inside the hook.
-- **`statusMessage`** is what the UI shows while a hook runs — worth setting on `PostToolUseFailure`, which can genuinely take seconds.
+- **`statusMessage`** is what the UI shows while a hook runs — worth setting on `PostToolUseFailure`, which can genuinely take a minute or more.
 - The Stop wake emits `{"decision":"block","reason":…}` because that is the only Stop output whose text actually reaches the model: `hookSpecificOutput.additionalContext` is silently dropped and `continue:true` is ignored (both verified against the rollout). Don't "normalize" the output to the additionalContext form that the other events use.
 - After a wake, ZCode re-fires Stop with `stop_hook_active=true` (the payload carries both that and the camelCase `stopHookActive`); the hook short-circuits on either spelling, so a wake cannot loop.
 - Hooks fire in `/goal` mode too — Stop and PostToolUse were both observed during goal runs, so the gate covers autonomous goal work as well.
@@ -143,7 +143,7 @@ Without a config file everything runs on the defaults (local Ollama) — the two
 
 ```toml
 # backend = "ollama"   # "ollama" | "claude" | "openai" (default: ollama)
-# timeout_secs = 90    # per-call deadline; unset → ollama 90 / claude 180 / openai 90
+# timeout_secs = 90    # per-call deadline; unset → ollama 90 / claude 600 / openai 90
 
 [ollama]               # applies when backend = "ollama"; values shown are the defaults
 url = "http://localhost:11434/v1/chat/completions"
@@ -171,7 +171,7 @@ timeout_secs = 600     # agentic reviews are slower; the deadline kill is the on
 ### Backends
 
 - **ollama** (default) — the local Ollama OpenAI-compatible endpoint over plain HTTP (hand-written client). Needs `ollama login` once and a running `ollama serve`; no API key. `kimi-k3:cloud` is Ollama's cloud-hosted model billed through your Ollama account — `ollama pull` can't fetch it and `/api/tags` doesn't list it.
-- **claude** — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 180s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) are scrubbed from the child.
+- **claude** — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 600s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) are scrubbed from the child.
 - **openai** — any OpenAI-compatible chat-completions endpoint over HTTP(S) via ureq/rustls (bundled webpki roots, no system cert store, no openssl). Sends `Authorization: Bearer <api_key>` and the `max_tokens` wire field (not the newer `max_completion_tokens`) — same scope as the Ollama path.
 
 ### The reviewer tool
