@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::server::{advisor_label, ask_advisor};
+use crate::server::ask_advisor;
 use crate::util::{create_private_dir, data_dir, now_secs, open_private_append, open_private_write, truncate};
 use crate::logger;
 
@@ -192,13 +192,13 @@ fn hook_post_tool_use_failure(m: &Value) {
         + "\n\nDiagnose likely causes and advise: what to check, what to try next, and when to stop and report to the user. Under 150 words, plain text.";
     let started = std::time::Instant::now();
     match ask_advisor(&q, "") {
-        Ok(advice) => {
+        Ok((advice, label)) => {
             logger::info(&format!(
                 "hook event=PostToolUseFailure sess={sess} stuck advice t={:?} len={}B",
                 started.elapsed(),
                 advice.len()
             ));
-            emit_context("PostToolUseFailure", &format!("[advisor stuck advice · {}]\n{advice}", advisor_label()));
+            emit_context("PostToolUseFailure", &format!("[advisor stuck advice · {label}]\n{advice}"));
         }
         Err(e) => {
             eprintln!("zcode-consultant-hook: stuck advice skipped: {e}");

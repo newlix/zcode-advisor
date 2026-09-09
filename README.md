@@ -153,6 +153,9 @@ max_tokens = 131072
 [claude]               # applies when backend = "claude"
 bin = "claude"         # resolved on PATH, then ~/.local/bin, /usr/local/bin
 model = ""             # empty = the CLI's own configured default model
+fallback_model = ""    # quota fallback: when the primary model fails with a
+                       # usage-limit/credits error, retry once with this model;
+                       # also passed to the CLI as --fallback-model. empty = off
 
 [openai]               # applies when backend = "openai"; url/model/api_key required
 url = "https://api.z.ai/api/paas/v4/chat/completions"
@@ -161,7 +164,7 @@ api_key = "${ZAI_API_KEY}"
 max_tokens = 8192      # bump to 16–32k for thinking models
 
 [reviewer]             # the review_change tool; always claude-CLI-backed (the tool loop)
-                       # regardless of the advisor backend; bin/model inherit [claude]
+                       # regardless of the advisor backend; bin/model/fallback_model inherit [claude]
 model = "opus"         # optional; default = [claude].model
 tools = "Read,Grep,Glob"  # whitelist-validated at load (read-only enforced)
 add_dirs = []          # extra --add-dir entries; the workspace (server cwd) is always readable
@@ -172,6 +175,7 @@ timeout_secs = 600     # agentic reviews are slower; the deadline kill is the on
 
 - **ollama** (default) — the local Ollama OpenAI-compatible endpoint over plain HTTP (hand-written client). Needs `ollama login` once and a running `ollama serve`; no API key. `kimi-k3:cloud` is Ollama's cloud-hosted model billed through your Ollama account — `ollama pull` can't fetch it and `/api/tags` doesn't list it.
 - **claude** — one-shot `claude -p` headless calls through the installed Claude Code CLI (prompt on stdin, plain text out); auth rides on the CLI's login. Hygiene flags make it a pure model call: no tools (`--restricted`), no user/project settings or MCP servers (`--setting-sources "" --strict-mcp-config`), no skills (`--disable-slash-commands`), no session files (`--no-session-persistence`). Default deadline is 600s (CLI cold start + large context); nested-session env markers (`CLAUDE_SESSION_ID`, `CLAUDECODE`, …) are scrubbed from the child.
+- **Quota fallback (claude backend)** — with `fallback_model` set, a quota-exhausted primary gets one retry with the fallback. Two layers: the CLI's native `--fallback-model` flag rides the primary attempt (its documented trigger is "overloaded or not available"), and the wrapper classifies the CLI's failure text on a clean failure (`usage limit`, `usage credits`, `credit balance`, `spend limit` — wordings verified in the CLI binary; terminal API errors land on **stdout** with exit 1, so the failure message leads with stdout) and retries with the fallback as primary. Both models over limit → one error naming both; the fallback's own non-quota error is surfaced as-is. Deadline kills are never retried (captured output mentioning usage limits may just be a long answer — a retry would double the wait). The advice/review prefix names the model that answered; caveat: if the CLI's own native fallback switched models mid-call, the label still names the primary. Known blind spot: a quota failure that hangs silently until the deadline kill stays a plain timeout.
 - **openai** — any OpenAI-compatible chat-completions endpoint over HTTP(S) via ureq/rustls (bundled webpki roots, no system cert store, no openssl). Sends `Authorization: Bearer <api_key>` and the `max_tokens` wire field (not the newer `max_completion_tokens`) — same scope as the Ollama path.
 
 ### The reviewer tool

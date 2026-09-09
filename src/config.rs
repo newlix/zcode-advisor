@@ -34,6 +34,9 @@ pub const OLLAMA_MODEL: &str = "kimi-k3:cloud";
 pub const OLLAMA_MAX_TOKENS: u64 = 131_072; // reasoning models burn max_tokens on thinking; keep generous
 pub const CLAUDE_BIN: &str = "claude";
 pub const CLAUDE_MODEL: &str = ""; // empty = the CLI's configured default model
+// quota fallback: when the primary model fails with a usage-limit/credits
+// error, retry once with this model. Empty = off.
+pub const CLAUDE_FALLBACK_MODEL: &str = "";
 pub const OPENAI_MAX_TOKENS: u64 = 8_192; // safe floor; bump to 16–32k for thinking models
 pub const OLLAMA_TIMEOUT: Duration = Duration::from_secs(90);
 // CLI cold start + a full conversation tail can push a one-shot claude call
@@ -50,7 +53,10 @@ pub enum Backend {
     /// Local Ollama's OpenAI-compatible endpoint (plain HTTP, no auth).
     Ollama { url: String, model: String, max_tokens: u64 },
     /// Claude Code CLI headless mode (`claude -p`), auth via the CLI's login.
-    Claude { bin: String, model: String },
+    /// `fallback_model` rides the CLI's native `--fallback-model` flag (the
+    /// CLI falls back when the primary is overloaded/unavailable) and also
+    /// drives the quota-retry in claude.rs.
+    Claude { bin: String, model: String, fallback_model: String },
     /// Any OpenAI-compatible chat-completions endpoint over HTTP(S) with a
     /// bearer key. The wire field is `max_tokens` (not the newer
     /// `max_completion_tokens`) — same scope as the Ollama path.
@@ -63,6 +69,7 @@ pub enum Backend {
 pub struct Reviewer {
     pub bin: String,
     pub model: String, // empty = CLI default
+    pub fallback_model: String, // empty = off; inherits [claude].fallback_model
     pub tools: String, // comma-separated, whitelist-validated at load
     pub add_dirs: Vec<String>,
     pub timeout: Duration,
@@ -77,7 +84,10 @@ impl Reviewer {
         } else {
             self.add_dirs.join(",")
         };
-        format!("model={model} tools={} add_dirs={dirs}", self.tools)
+        match self.fallback_model.trim().is_empty() {
+            true => format!("model={model} tools={} add_dirs={dirs}", self.tools),
+            false => format!("model={model} fallback={} tools={} add_dirs={dirs}", self.fallback_model, self.tools),
+        }
     }
 }
 
@@ -118,6 +128,7 @@ struct OllamaSection {
 struct ClaudeSection {
     bin: Option<String>,
     model: Option<String>,
+    fallback_model: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -133,6 +144,7 @@ struct OpenAiSection {
 #[serde(deny_unknown_fields)]
 struct ReviewerSection {
     model: Option<String>,
+    fallback_model: Option<String>,
     tools: Option<String>,
     add_dirs: Option<Vec<String>>,
     timeout_secs: Option<u64>,
@@ -149,6 +161,7 @@ pub fn default_config() -> Config {
         reviewer: Reviewer {
             bin: CLAUDE_BIN.to_string(),
             model: CLAUDE_MODEL.to_string(),
+            fallback_model: CLAUDE_FALLBACK_MODEL.to_string(),
             tools: REVIEWER_TOOLS.to_string(),
             add_dirs: Vec::new(),
             timeout: REVIEWER_TIMEOUT,
@@ -216,9 +229,9 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
     let timeout = f.timeout_secs.map(parse_timeout).transpose()?;
     // the reviewer defaults inherit [claude]'s bin/model (one CLI install for
     // both tools), so read them before the backend match consumes the section
-    let (claude_bin, claude_model) = match &f.claude {
-        Some(s) => (s.bin.clone(), s.model.clone()),
-        None => (None, None),
+    let (claude_bin, claude_model, claude_fallback) = match &f.claude {
+        Some(s) => (s.bin.clone(), s.model.clone(), s.fallback_model.clone()),
+        None => (None, None, None),
     };
     let rs = f.reviewer.unwrap_or_default();
     let reviewer = Reviewer {
@@ -226,6 +239,10 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
         model: match rs.model {
             Some(m) => interpolate(&m)?,
             None => interp_opt(claude_model, CLAUDE_MODEL)?,
+        },
+        fallback_model: match rs.fallback_model {
+            Some(m) => interpolate(&m)?,
+            None => interp_opt(claude_fallback, CLAUDE_FALLBACK_MODEL)?,
         },
         tools: validate_reviewer_tools(&interp_opt(rs.tools, REVIEWER_TOOLS)?)?,
         add_dirs: rs
@@ -250,7 +267,8 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
             let s = f.claude.unwrap_or_default();
             let bin = interp_opt(s.bin, CLAUDE_BIN)?;
             let model = interp_opt(s.model, CLAUDE_MODEL)?;
-            Config { backend: Backend::Claude { bin, model }, timeout: CLAUDE_TIMEOUT, reviewer, warning: None }
+            let fallback_model = interp_opt(s.fallback_model, CLAUDE_FALLBACK_MODEL)?;
+            Config { backend: Backend::Claude { bin, model, fallback_model }, timeout: CLAUDE_TIMEOUT, reviewer, warning: None }
         }
         "openai" => {
             let s = f.openai.ok_or("backend \"openai\" requires an [openai] section")?;
@@ -403,11 +421,11 @@ impl Backend {
             Backend::Ollama { url, model, max_tokens } => {
                 format!("ollama url={url} model={model} max_tokens={max_tokens}")
             }
-            Backend::Claude { model, .. } => {
-                if model.trim().is_empty() {
-                    "claude model=<cli-default>".to_string()
-                } else {
-                    format!("claude model={model}")
+            Backend::Claude { model, fallback_model, .. } => {
+                let m = if model.trim().is_empty() { "<cli-default>".to_string() } else { model.clone() };
+                match fallback_model.trim().is_empty() {
+                    true => format!("claude model={m}"),
+                    false => format!("claude model={m} fallback={fallback_model}"),
                 }
             }
             Backend::OpenAi { url, model, max_tokens, .. } => {
@@ -507,6 +525,34 @@ mod tests {
         let c = from_toml_str("backend = \"claude\"").unwrap();
         assert!(matches!(c.backend, Backend::Claude { ref bin, .. } if bin == CLAUDE_BIN));
         assert_eq!(c.timeout, CLAUDE_TIMEOUT);
+    }
+
+    #[test]
+    fn fallback_model_parses_and_inherits() {
+        // default: fallback off
+        let c = from_toml_str("").unwrap();
+        assert!(matches!(c.reviewer.fallback_model.as_str(), "" if true));
+        // [claude] fallback flows into the backend and the reviewer (same
+        // inheritance as bin/model)
+        let c = from_toml_str("backend = \"claude\"\n[claude]\nmodel = \"fable\"\nfallback_model = \"opus\"").unwrap();
+        match &c.backend {
+            Backend::Claude { model, fallback_model, .. } => {
+                assert_eq!(model, "fable");
+                assert_eq!(fallback_model, "opus");
+            }
+            other => panic!("wrong backend: {other:?}"),
+        }
+        assert_eq!(c.reviewer.fallback_model, "opus");
+        // [reviewer] override wins over inheritance
+        let c = from_toml_str(
+            "backend = \"claude\"\n[claude]\nfallback_model = \"opus\"\n[reviewer]\nfallback_model = \"sonnet\"",
+        )
+        .unwrap();
+        assert_eq!(c.reviewer.fallback_model, "sonnet");
+        assert!(matches!(&c.backend, Backend::Claude { fallback_model, .. } if fallback_model == "opus"));
+        // summary carries the chain without secrets
+        let s = c.backend.kind_and_summary();
+        assert!(s.contains("fallback=opus"), "{s}");
     }
 
     #[test]

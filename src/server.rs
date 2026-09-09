@@ -50,12 +50,21 @@ impl Drop for InFlightGuard {
     }
 }
 
-// advisor_label: a short, redacted identity for the response prefix and tool
-// description (never the api_key; openai names the host, not the full URL).
+// advisor_label: a short, redacted identity for the tool description — the
+// configured advisor chain (never the api_key; openai names the host, not the
+// full URL). The consult result prefix instead names the model that actually
+// answered (see ask_advisor).
 pub fn advisor_label() -> String {
     match &config::global().backend {
         config::Backend::Ollama { model, .. } => format!("{model} via Ollama"),
-        config::Backend::Claude { model, .. } => claude_label(model),
+        config::Backend::Claude { model, fallback_model, .. } => {
+            let m = if model.trim().is_empty() { "<cli-default>" } else { model };
+            if fallback_model.trim().is_empty() {
+                format!("{m} via Claude Code")
+            } else {
+                format!("{m}→{fallback_model} via Claude Code")
+            }
+        }
         config::Backend::OpenAi { url, model, .. } => format!("{model} @ {}", config::host_of(url)),
     }
 }
@@ -70,7 +79,12 @@ fn claude_label(model: &str) -> String {
 }
 
 pub fn reviewer_label() -> String {
-    claude_label(&config::global().reviewer.model)
+    let rcfg = &config::global().reviewer;
+    if rcfg.fallback_model.trim().is_empty() {
+        return claude_label(&rcfg.model);
+    }
+    let m = if rcfg.model.trim().is_empty() { "<cli-default>" } else { &rcfg.model };
+    format!("{m}→{} via Claude Code", rcfg.fallback_model)
 }
 
 // tool_description: the tool's usage guidance with the configured advisor's
@@ -413,7 +427,7 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
             ));
             advice_error(&format!("error: {warning_tag}{e}"))
         }
-        Ok(advice) => {
+        Ok((advice, label)) => {
             logger::info(&format!(
                 "consult done sess={matched_sess} t={:?} ctx={}B advice={}B",
                 started.elapsed(),
@@ -421,8 +435,7 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
                 advice.len()
             ));
             CallToolResult::success(vec![ContentBlock::text(format!(
-                "{warning_tag}[advisor · {}{}]\n{advice}",
-                advisor_label(),
+                "{warning_tag}[advisor · {label}{}]\n{advice}",
                 parts.note
             ))])
         }
@@ -480,6 +493,7 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
     match claude::ask_review(
         &rcfg.bin,
         &rcfg.model,
+        &rcfg.fallback_model,
         REVIEWER_SYSTEM_PROMPT,
         &rcfg.tools,
         &rcfg.add_dirs,
@@ -494,7 +508,7 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
             ));
             advice_error(&format!("error: {warning_tag}{e}"))
         }
-        Ok(review) => {
+        Ok((review, answered)) => {
             logger::info(&format!(
                 "review done sess={matched_sess} t={:?} ctx={}B review={}B",
                 started.elapsed(),
@@ -503,7 +517,7 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
             ));
             CallToolResult::success(vec![ContentBlock::text(format!(
                 "{warning_tag}[reviewer · {}{}]\n{review}",
-                reviewer_label(),
+                claude_label(&answered),
                 parts.note
             ))])
         }
@@ -511,9 +525,12 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
 }
 
 // ask_advisor routes to the configured backend. Shared by the MCP tool and
-// hook mode; any error returns Err and the caller decides the presentation
-// (MCP returns an is_error result, hooks pass through silently).
-pub fn ask_advisor(question: &str, context_str: &str) -> Result<String, String> {
+// hook mode. Returns (advice, label of the model that actually answered) —
+// the claude backend's quota retry can make the fallback the answerer, and
+// the callers tag their output with the label. Any error returns Err and the
+// caller decides the presentation (MCP returns an is_error result, hooks pass
+// through silently).
+pub fn ask_advisor(question: &str, context_str: &str) -> Result<(String, String), String> {
     let cfg = config::global();
     let mut user_msg = question.to_string();
     if !context_str.trim().is_empty() {
@@ -523,11 +540,16 @@ pub fn ask_advisor(question: &str, context_str: &str) -> Result<String, String> 
     match &cfg.backend {
         config::Backend::Ollama { url, model, max_tokens } => {
             ask_chat_completions(url, model, *max_tokens, None, &user_msg, cfg.timeout)
+                .map(|text| (text, format!("{model} via Ollama")))
         }
         config::Backend::OpenAi { url, model, api_key, max_tokens } => {
             ask_chat_completions(url, model, *max_tokens, Some(api_key), &user_msg, cfg.timeout)
+                .map(|text| (text, format!("{model} @ {}", config::host_of(url))))
         }
-        config::Backend::Claude { bin, model } => claude::ask(bin, model, ADVISOR_SYSTEM_PROMPT, &user_msg, cfg.timeout),
+        config::Backend::Claude { bin, model, fallback_model } => {
+            claude::ask(bin, model, fallback_model, ADVISOR_SYSTEM_PROMPT, &user_msg, cfg.timeout)
+                .map(|(text, answered)| (text, claude_label(&answered)))
+        }
     }
 }
 
