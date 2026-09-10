@@ -275,8 +275,13 @@ echo '{"session_id":"s1"}' | ~/.cargo/bin/zcode-consultant hook Stop   # no outp
 rm ~/.local/share/zcode-consultant/state/s1.state.json   # clean up the test state
 ```
 
-`zcode-consultant --version` prints the package version (3.1.6) and exits —
-it does not fall through to server mode.
+`zcode-consultant --version` prints the package version followed by the
+effective-configuration report for this environment — the config file's
+location and status (found / not found → built-in defaults / broken →
+defaults + the warning), the backend and reviewer actually in effect,
+whether the claude binary resolves the way a consult would, and the data
+directory — then exits; it does not fall through to server mode. First stop
+when a machine consults the wrong model or the advisor can't be reached.
 
 **Reproducing content**: consultant.log records only structural traces (decisions, outcomes, timings, sizes), never content — "what the advisor actually saw" (the full question, the conversation view, the advice text) is preserved natively and permanently in ZCode's rollout files:
 
