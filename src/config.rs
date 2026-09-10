@@ -1,11 +1,11 @@
 // Configuration: an optional TOML file selecting the advisor backend and its
-// knobs. Absent file → pure defaults, so the two built-in methods (local
-// Ollama, Claude Code CLI) work with zero configuration. A file that is
+// knobs. Absent file → pure defaults: the Claude Code CLI asking fable with
+// an opus quota fallback — the zero-configuration path. A file that is
 // present but broken (parse error, unknown key, unset ${VAR}, missing
 // required field) falls back to defaults too — the advisor must never hold up
 // real work — but loudly: the warning travels to stderr, the ERROR log, and
-// the prefix of the next consult's result (a silent fallback to ollama when
-// the user configured openai would waste hours).
+// the prefix of the next consult's result (a silent fallback to claude
+// defaults when the user configured openai would waste hours).
 //
 // Every string value in the file supports environment-variable interpolation:
 //   ${VAR}        → value of VAR; unset or empty → config error
@@ -33,10 +33,16 @@ pub const OLLAMA_URL: &str = "http://localhost:11434/v1/chat/completions";
 pub const OLLAMA_MODEL: &str = "kimi-k3:cloud";
 pub const OLLAMA_MAX_TOKENS: u64 = 131_072; // reasoning models burn max_tokens on thinking; keep generous
 pub const CLAUDE_BIN: &str = "claude";
-pub const CLAUDE_MODEL: &str = ""; // empty = the CLI's configured default model
-// quota fallback: when the primary model fails with a usage-limit/credits
-// error, retry once with this model. Empty = off.
-pub const CLAUDE_FALLBACK_MODEL: &str = "";
+// Default model chain: the CLI's fable alias with an opus model fallback —
+// chosen defaults, not "whatever the CLI is set to": the advisor's quality
+// bar shouldn't drift with the CLI's own default-model setting. Setting
+// model = "" in the config file still means "the CLI's default" (then make
+// sure the CLI's default isn't the fallback model — the CLI rejects that).
+pub const CLAUDE_MODEL: &str = "fable";
+// model fallback: passed to the CLI as its native --fallback-model (comma-
+// separated list allowed; the CLI switches models when the primary is
+// overloaded or not available). Empty = off.
+pub const CLAUDE_FALLBACK_MODEL: &str = "opus";
 pub const OPENAI_MAX_TOKENS: u64 = 8_192; // safe floor; bump to 16–32k for thinking models
 pub const OLLAMA_TIMEOUT: Duration = Duration::from_secs(90);
 // CLI cold start + a full conversation tail can push a one-shot claude call
@@ -54,8 +60,7 @@ pub enum Backend {
     Ollama { url: String, model: String, max_tokens: u64 },
     /// Claude Code CLI headless mode (`claude -p`), auth via the CLI's login.
     /// `fallback_model` rides the CLI's native `--fallback-model` flag (the
-    /// CLI falls back when the primary is overloaded/unavailable) and also
-    /// drives the quota-retry in claude.rs.
+    /// CLI falls back when the primary is overloaded/unavailable).
     Claude { bin: String, model: String, fallback_model: String },
     /// Any OpenAI-compatible chat-completions endpoint over HTTP(S) with a
     /// bearer key. The wire field is `max_tokens` (not the newer
@@ -152,12 +157,12 @@ struct ReviewerSection {
 
 pub fn default_config() -> Config {
     Config {
-        backend: Backend::Ollama {
-            url: OLLAMA_URL.to_string(),
-            model: OLLAMA_MODEL.to_string(),
-            max_tokens: OLLAMA_MAX_TOKENS,
+        backend: Backend::Claude {
+            bin: CLAUDE_BIN.to_string(),
+            model: CLAUDE_MODEL.to_string(),
+            fallback_model: CLAUDE_FALLBACK_MODEL.to_string(),
         },
-        timeout: OLLAMA_TIMEOUT,
+        timeout: CLAUDE_TIMEOUT,
         reviewer: Reviewer {
             bin: CLAUDE_BIN.to_string(),
             model: CLAUDE_MODEL.to_string(),
@@ -253,7 +258,7 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
             .collect::<Result<Vec<_>, _>>()?,
         timeout: rs.timeout_secs.map(parse_timeout).transpose()?.unwrap_or(REVIEWER_TIMEOUT),
     };
-    let backend_name = f.backend.as_deref().unwrap_or("ollama");
+    let backend_name = f.backend.as_deref().unwrap_or("claude");
     let mut cfg = match backend_name {
         "ollama" => {
             let s = f.ollama.unwrap_or_default();
@@ -482,8 +487,9 @@ mod tests {
     #[test]
     fn empty_string_is_valid_defaults() {
         let c = from_toml_str("").unwrap();
-        assert!(matches!(c.backend, Backend::Ollama { ref model, .. } if model == OLLAMA_MODEL));
-        assert_eq!(c.timeout, OLLAMA_TIMEOUT);
+        assert!(matches!(c.backend, Backend::Claude { ref model, ref fallback_model, .. }
+            if model == CLAUDE_MODEL && fallback_model == CLAUDE_FALLBACK_MODEL));
+        assert_eq!(c.timeout, CLAUDE_TIMEOUT);
         assert!(c.warning.is_none());
     }
 
@@ -529,9 +535,9 @@ mod tests {
 
     #[test]
     fn fallback_model_parses_and_inherits() {
-        // default: fallback off
+        // default: the built-in chain fable→opus
         let c = from_toml_str("").unwrap();
-        assert!(matches!(c.reviewer.fallback_model.as_str(), "" if true));
+        assert_eq!(c.reviewer.fallback_model, CLAUDE_FALLBACK_MODEL);
         // [claude] fallback flows into the backend and the reviewer (same
         // inheritance as bin/model)
         let c = from_toml_str("backend = \"claude\"\n[claude]\nmodel = \"fable\"\nfallback_model = \"opus\"").unwrap();
@@ -557,14 +563,16 @@ mod tests {
 
     #[test]
     fn reviewer_defaults_and_inheritance() {
-        // no config: read-only whitelist, 600s, claude CLI defaults
+        // no config: read-only whitelist, 600s, and the claude default chain
+        // (reviewer inherits [claude]'s model/fallback → fable/opus)
         let c = from_toml_str("").unwrap();
         assert_eq!(c.reviewer.tools, REVIEWER_TOOLS);
         assert_eq!(c.reviewer.timeout, REVIEWER_TIMEOUT);
         assert_eq!(c.reviewer.bin, CLAUDE_BIN);
-        assert!(c.reviewer.model.is_empty());
+        assert_eq!(c.reviewer.model, CLAUDE_MODEL);
+        assert_eq!(c.reviewer.fallback_model, CLAUDE_FALLBACK_MODEL);
         // [claude] section is inherited even when the advisor backend is ollama
-        let c = from_toml_str("[claude]\nbin = \"/opt/claude\"\nmodel = \"sonnet\"").unwrap();
+        let c = from_toml_str("backend = \"ollama\"\n[claude]\nbin = \"/opt/claude\"\nmodel = \"sonnet\"").unwrap();
         assert_eq!(c.reviewer.bin, "/opt/claude");
         assert_eq!(c.reviewer.model, "sonnet");
         // [reviewer] overrides win over inheritance
@@ -576,7 +584,11 @@ mod tests {
         assert_eq!(c.reviewer.model, "opus");
         assert_eq!(c.reviewer.timeout, Duration::from_secs(60));
         assert_eq!(c.reviewer.add_dirs, vec!["/tmp/probe", "/interp-worked"]);
-        assert_eq!(c.reviewer.summary(), "model=opus tools=Read,Grep,Glob add_dirs=/tmp/probe,/interp-worked");
+        // fallback_model unset anywhere → inherits the built-in opus default
+        assert_eq!(
+            c.reviewer.summary(),
+            "model=opus fallback=opus tools=Read,Grep,Glob add_dirs=/tmp/probe,/interp-worked"
+        );
     }
 
     #[test]
@@ -609,7 +621,9 @@ mod tests {
         // a secret in the broken line must not travel with the error text
         let err = from_toml_str("what = 1\napi_key = \"sk-super-secret-123\"").unwrap_err();
         assert!(!err.contains("sk-super-secret"), "leaked: {err}");
-        let err = from_toml_str("[ollama]\nmodel = \"${unterminated\"").unwrap_err();
+        // an [ollama] section is only validated when it's the chosen backend
+        // (the default is claude) — select it explicitly to exercise the path
+        let err = from_toml_str("backend = \"ollama\"\n[ollama]\nmodel = \"${unterminated\"").unwrap_err();
         assert!(err.contains("unterminated"), "{err}");
         assert!(!err.contains("${unterminated"), "raw value leaked: {err}");
         assert!(
@@ -619,7 +633,7 @@ mod tests {
             .unwrap_err()
             .contains("ZCA_DEFINITELY_UNSET_VAR")
         );
-        assert!(from_toml_str("[ollama]\nmax_tokens = 8").unwrap_err().contains("too small"));
+        assert!(from_toml_str("backend = \"ollama\"\n[ollama]\nmax_tokens = 8").unwrap_err().contains("too small"));
     }
 
     #[test]

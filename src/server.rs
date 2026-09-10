@@ -50,10 +50,9 @@ impl Drop for InFlightGuard {
     }
 }
 
-// advisor_label: a short, redacted identity for the tool description — the
-// configured advisor chain (never the api_key; openai names the host, not the
-// full URL). The consult result prefix instead names the model that actually
-// answered (see ask_advisor).
+// advisor_label: a short, redacted identity for the consult prefix and tool
+// description — the configured advisor chain (never the api_key; openai
+// names the host, not the full URL).
 pub fn advisor_label() -> String {
     match &config::global().backend {
         config::Backend::Ollama { model, .. } => format!("{model} via Ollama"),
@@ -427,7 +426,7 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
             ));
             advice_error(&format!("error: {warning_tag}{e}"))
         }
-        Ok((advice, label)) => {
+        Ok(advice) => {
             logger::info(&format!(
                 "consult done sess={matched_sess} t={:?} ctx={}B advice={}B",
                 started.elapsed(),
@@ -435,7 +434,8 @@ fn consult(question: &str, context_str: &str) -> CallToolResult {
                 advice.len()
             ));
             CallToolResult::success(vec![ContentBlock::text(format!(
-                "{warning_tag}[advisor · {label}{}]\n{advice}",
+                "{warning_tag}[advisor · {}{}]\n{advice}",
+                advisor_label(),
                 parts.note
             ))])
         }
@@ -508,7 +508,7 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
             ));
             advice_error(&format!("error: {warning_tag}{e}"))
         }
-        Ok((review, answered)) => {
+        Ok(review) => {
             logger::info(&format!(
                 "review done sess={matched_sess} t={:?} ctx={}B review={}B",
                 started.elapsed(),
@@ -517,7 +517,7 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
             ));
             CallToolResult::success(vec![ContentBlock::text(format!(
                 "{warning_tag}[reviewer · {}{}]\n{review}",
-                claude_label(&answered),
+                reviewer_label(),
                 parts.note
             ))])
         }
@@ -525,12 +525,11 @@ fn review(question: &str, context_str: &str) -> CallToolResult {
 }
 
 // ask_advisor routes to the configured backend. Shared by the MCP tool and
-// hook mode. Returns (advice, label of the model that actually answered) —
-// the claude backend's quota retry can make the fallback the answerer, and
-// the callers tag their output with the label. Any error returns Err and the
-// caller decides the presentation (MCP returns an is_error result, hooks pass
-// through silently).
-pub fn ask_advisor(question: &str, context_str: &str) -> Result<(String, String), String> {
+// hook mode; any error returns Err and the caller decides the presentation
+// (MCP returns an is_error result, hooks pass through silently). Model
+// failure fallback is the claude CLI's own --fallback-model machinery, so
+// the callers label output with the configured chain (advisor_label).
+pub fn ask_advisor(question: &str, context_str: &str) -> Result<String, String> {
     let cfg = config::global();
     let mut user_msg = question.to_string();
     if !context_str.trim().is_empty() {
@@ -540,15 +539,12 @@ pub fn ask_advisor(question: &str, context_str: &str) -> Result<(String, String)
     match &cfg.backend {
         config::Backend::Ollama { url, model, max_tokens } => {
             ask_chat_completions(url, model, *max_tokens, None, &user_msg, cfg.timeout)
-                .map(|text| (text, format!("{model} via Ollama")))
         }
         config::Backend::OpenAi { url, model, api_key, max_tokens } => {
             ask_chat_completions(url, model, *max_tokens, Some(api_key), &user_msg, cfg.timeout)
-                .map(|text| (text, format!("{model} @ {}", config::host_of(url))))
         }
         config::Backend::Claude { bin, model, fallback_model } => {
             claude::ask(bin, model, fallback_model, ADVISOR_SYSTEM_PROMPT, &user_msg, cfg.timeout)
-                .map(|(text, answered)| (text, claude_label(&answered)))
         }
     }
 }
