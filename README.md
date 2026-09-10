@@ -165,9 +165,11 @@ api_key = "${ZAI_API_KEY}"
 max_tokens = 8192      # bump to 16–32k for thinking models
 
 [reviewer]             # the review_change tool; always claude-CLI-backed (the tool loop)
-                       # regardless of the advisor backend; bin/model/fallback_model inherit [claude]
-model = "fable"        # optional; default = [claude].model
-fallback_model = "opus"  # optional; default = [claude].fallback_model
+                       # regardless of the advisor backend; bin/fallback_model inherit [claude]
+model = "opus"         # the reviewer's own default (the strongest second opinion) — does
+                       # NOT follow [claude].model
+fallback_model = "opus"  # optional; default = [claude].fallback_model (inert while it
+                       # equals the model — the CLI rejects a same-model fallback)
 tools = "Read,Grep,Glob"  # whitelist-validated at load (read-only enforced)
 add_dirs = []          # extra --add-dir entries; the workspace (server cwd) is always readable
 timeout_secs = 600     # agentic reviews are slower; the deadline kill is the only turn bound

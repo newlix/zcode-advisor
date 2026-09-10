@@ -58,10 +58,9 @@ pub fn advisor_label() -> String {
         config::Backend::Ollama { model, .. } => format!("{model} via Ollama"),
         config::Backend::Claude { model, fallback_model, .. } => {
             let m = if model.trim().is_empty() { "<cli-default>" } else { model };
-            if fallback_model.trim().is_empty() {
-                format!("{m} via Claude Code")
-            } else {
-                format!("{m}→{fallback_model} via Claude Code")
+            match fallback_model.trim().is_empty() || fallback_model.trim() == model.trim() {
+                true => format!("{m} via Claude Code"),
+                false => format!("{m}→{fallback_model} via Claude Code"),
             }
         }
         config::Backend::OpenAi { url, model, .. } => format!("{model} @ {}", config::host_of(url)),
@@ -79,11 +78,13 @@ fn claude_label(model: &str) -> String {
 
 pub fn reviewer_label() -> String {
     let rcfg = &config::global().reviewer;
-    if rcfg.fallback_model.trim().is_empty() {
-        return claude_label(&rcfg.model);
+    match rcfg.fallback_model.trim().is_empty() || rcfg.fallback_model.trim() == rcfg.model.trim() {
+        true => claude_label(&rcfg.model),
+        false => {
+            let m = if rcfg.model.trim().is_empty() { "<cli-default>" } else { &rcfg.model };
+            format!("{m}→{} via Claude Code", rcfg.fallback_model)
+        }
     }
-    let m = if rcfg.model.trim().is_empty() { "<cli-default>" } else { &rcfg.model };
-    format!("{m}→{} via Claude Code", rcfg.fallback_model)
 }
 
 // tool_description: the tool's usage guidance with the configured advisor's

@@ -43,6 +43,10 @@ pub const CLAUDE_MODEL: &str = "fable";
 // separated list allowed; the CLI switches models when the primary is
 // overloaded or not available). Empty = off.
 pub const CLAUDE_FALLBACK_MODEL: &str = "opus";
+// The reviewer is the second opinion — quality over cost, so its default is
+// the strongest model, deliberately NOT following [claude].model. Override
+// with [reviewer].model. (bin/fallback_model still inherit [claude].)
+pub const REVIEWER_MODEL: &str = "opus";
 pub const OPENAI_MAX_TOKENS: u64 = 8_192; // safe floor; bump to 16–32k for thinking models
 pub const OLLAMA_TIMEOUT: Duration = Duration::from_secs(90);
 // CLI cold start + a full conversation tail can push a one-shot claude call
@@ -81,7 +85,9 @@ pub struct Reviewer {
 }
 
 impl Reviewer {
-    /// Redacted one-line identity for logs.
+    /// Redacted one-line identity for logs. fallback is omitted while it
+    /// equals the model — the CLI rejects a fallback equal to the main
+    /// model, so base_args suppresses the flag and the display follows.
     pub fn summary(&self) -> String {
         let model = if self.model.trim().is_empty() { "<cli-default>" } else { &self.model };
         let dirs = if self.add_dirs.is_empty() {
@@ -89,10 +95,13 @@ impl Reviewer {
         } else {
             self.add_dirs.join(",")
         };
-        match self.fallback_model.trim().is_empty() {
-            true => format!("model={model} tools={} add_dirs={dirs}", self.tools),
-            false => format!("model={model} fallback={} tools={} add_dirs={dirs}", self.fallback_model, self.tools),
-        }
+        let fb = self.fallback_model.trim();
+        let fallback = if !fb.is_empty() && fb != self.model.trim() {
+            format!("fallback={} ", self.fallback_model)
+        } else {
+            String::new()
+        };
+        format!("model={model} {fallback}tools={} add_dirs={dirs}", self.tools)
     }
 }
 
@@ -165,7 +174,7 @@ pub fn default_config() -> Config {
         timeout: CLAUDE_TIMEOUT,
         reviewer: Reviewer {
             bin: CLAUDE_BIN.to_string(),
-            model: CLAUDE_MODEL.to_string(),
+            model: REVIEWER_MODEL.to_string(),
             fallback_model: CLAUDE_FALLBACK_MODEL.to_string(),
             tools: REVIEWER_TOOLS.to_string(),
             add_dirs: Vec::new(),
@@ -232,18 +241,19 @@ pub fn from_toml_str(raw: &str) -> Result<Config, String> {
     // the raw text must not travel with it
     let f: FileConfig = toml::from_str(raw).map_err(|e| format!("invalid TOML: {}", e.message()))?;
     let timeout = f.timeout_secs.map(parse_timeout).transpose()?;
-    // the reviewer defaults inherit [claude]'s bin/model (one CLI install for
-    // both tools), so read them before the backend match consumes the section
-    let (claude_bin, claude_model, claude_fallback) = match &f.claude {
-        Some(s) => (s.bin.clone(), s.model.clone(), s.fallback_model.clone()),
-        None => (None, None, None),
+    // the reviewer inherits [claude]'s bin/fallback_model (one CLI install,
+    // one fallback story) but has its own default model — read the section
+    // before the backend match consumes it
+    let (claude_bin, claude_fallback) = match &f.claude {
+        Some(s) => (s.bin.clone(), s.fallback_model.clone()),
+        None => (None, None),
     };
     let rs = f.reviewer.unwrap_or_default();
     let reviewer = Reviewer {
         bin: interp_opt(claude_bin, CLAUDE_BIN)?,
         model: match rs.model {
             Some(m) => interpolate(&m)?,
-            None => interp_opt(claude_model, CLAUDE_MODEL)?,
+            None => REVIEWER_MODEL.to_string(),
         },
         fallback_model: match rs.fallback_model {
             Some(m) => interpolate(&m)?,
@@ -563,18 +573,19 @@ mod tests {
 
     #[test]
     fn reviewer_defaults_and_inheritance() {
-        // no config: read-only whitelist, 600s, and the claude default chain
-        // (reviewer inherits [claude]'s model/fallback → fable/opus)
+        // no config: read-only whitelist, 600s, reviewer's own opus default
+        // (deliberately not [claude]'s fable), fallback inherited
         let c = from_toml_str("").unwrap();
         assert_eq!(c.reviewer.tools, REVIEWER_TOOLS);
         assert_eq!(c.reviewer.timeout, REVIEWER_TIMEOUT);
         assert_eq!(c.reviewer.bin, CLAUDE_BIN);
-        assert_eq!(c.reviewer.model, CLAUDE_MODEL);
+        assert_eq!(c.reviewer.model, REVIEWER_MODEL);
         assert_eq!(c.reviewer.fallback_model, CLAUDE_FALLBACK_MODEL);
         // [claude] section is inherited even when the advisor backend is ollama
+        // — bin, not the model (the reviewer keeps its own default)
         let c = from_toml_str("backend = \"ollama\"\n[claude]\nbin = \"/opt/claude\"\nmodel = \"sonnet\"").unwrap();
         assert_eq!(c.reviewer.bin, "/opt/claude");
-        assert_eq!(c.reviewer.model, "sonnet");
+        assert_eq!(c.reviewer.model, REVIEWER_MODEL);
         // [reviewer] overrides win over inheritance
         std::env::set_var("ZCA_TEST_DIR", "/interp-worked"); // don't rely on interpolation_rules' env (parallel tests)
         let c = from_toml_str(
@@ -584,10 +595,11 @@ mod tests {
         assert_eq!(c.reviewer.model, "opus");
         assert_eq!(c.reviewer.timeout, Duration::from_secs(60));
         assert_eq!(c.reviewer.add_dirs, vec!["/tmp/probe", "/interp-worked"]);
-        // fallback_model unset anywhere → inherits the built-in opus default
+        // fallback_model unset → inherits the built-in opus default; while it
+        // equals the model the flag is inert, so the summary omits it
         assert_eq!(
             c.reviewer.summary(),
-            "model=opus fallback=opus tools=Read,Grep,Glob add_dirs=/tmp/probe,/interp-worked"
+            "model=opus tools=Read,Grep,Glob add_dirs=/tmp/probe,/interp-worked"
         );
     }
 
