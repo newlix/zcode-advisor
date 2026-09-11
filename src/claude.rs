@@ -130,9 +130,29 @@ fn run(bin: &Path, args: &[String], prompt: &str, timeout: Duration) -> Result<S
     cmd.args(args);
     // Nested-session markers must not leak into the child: CLAUDE_SESSION_ID
     // is injected by ZCode (hooks path) and would confuse a claude child;
-    // CLAUDECODE*/entrypoint mark a running Claude Code parent. Auth
-    // (ANTHROPIC_API_KEY, credentials) is deliberately kept.
-    for var in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID"] {
+    // CLAUDECODE*/entrypoint mark a running Claude Code parent. Auth is also
+    // scrubbed: ZCode injects its own provider credentials into spawned
+    // children (ANTHROPIC_API_KEY + ZCODE_BASE_URL, no ANTHROPIC_BASE_URL),
+    // which the CLI would prefer over its login — sending a foreign key to
+    // the default endpoint. The advisor is meant to ride the CLI's own
+    // login, so the whole injected auth/routing family goes (keys, tokens,
+    // base URLs, custom headers, model and Bedrock/Vertex backend
+    // switches). Settings-file auth such as apiKeyHelper is already out:
+    // --setting-sources "" loads no settings.
+    for var in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_SESSION_ID",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ZCODE_BASE_URL",
+    ] {
         cmd.env_remove(var);
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -492,17 +512,29 @@ mod tests {
     }
 
     #[test]
-    fn env_scrub_hides_nested_session_markers() {
+    fn env_scrub_hides_nested_session_markers_and_injected_auth() {
         std::env::set_var("CLAUDE_SESSION_ID", "sess_leak");
         std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-injected");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-injected");
+        std::env::set_var("ANTHROPIC_BASE_URL", "http://injected.example");
+        std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "x-api-key: sk-injected");
+        std::env::set_var("ANTHROPIC_MODEL", "injected-model");
+        std::env::set_var("ANTHROPIC_SMALL_FAST_MODEL", "injected-small");
+        std::env::set_var("CLAUDE_CODE_USE_BEDROCK", "1");
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::set_var("ZCODE_BASE_URL", "http://api.z.ai/api/anthropic");
         let out = run(
             Path::new("/bin/sh"),
-            &s(&["-c", "echo \"sid=[$CLAUDE_SESSION_ID] cc=[$CLAUDECODE]\""]),
+            &s(&["-c", "echo \"sid=[$CLAUDE_SESSION_ID] cc=[$CLAUDECODE] key=[$ANTHROPIC_API_KEY] tok=[$ANTHROPIC_AUTH_TOKEN] abu=[$ANTHROPIC_BASE_URL] hdr=[$ANTHROPIC_CUSTOM_HEADERS] mdl=[$ANTHROPIC_MODEL] small=[$ANTHROPIC_SMALL_FAST_MODEL] bedrock=[$CLAUDE_CODE_USE_BEDROCK] vertex=[$CLAUDE_CODE_USE_VERTEX] zurl=[$ZCODE_BASE_URL]\""]),
             "",
             Duration::from_secs(10),
         )
         .unwrap();
-        assert_eq!(out, "sid=[] cc=[]");
+        assert_eq!(
+            out,
+            "sid=[] cc=[] key=[] tok=[] abu=[] hdr=[] mdl=[] small=[] bedrock=[] vertex=[] zurl=[]"
+        );
     }
 
     #[test]
